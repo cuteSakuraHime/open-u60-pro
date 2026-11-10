@@ -5,6 +5,7 @@ struct CallView: View {
     /// swap in a fresh view model (and a fresh poll loop) mid-call.
     @State private var viewModel: CallViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var showHistory = false
 
     init(viewModel: CallViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -14,9 +15,19 @@ struct CallView: View {
         VStack(spacing: 0) {
             // Top bar
             HStack {
+                Button("通话记录") { showHistory = true }
+                    .padding()
                 Spacer()
                 Button("Close") { dismiss() }
                     .padding()
+            }
+            .sheet(isPresented: $showHistory) {
+                NavigationStack {
+                    CallHistoryView(store: viewModel.history) { number in
+                        viewModel.phoneNumber = number
+                        showHistory = false
+                    }
+                }
             }
 
             Spacer()
@@ -53,7 +64,6 @@ struct CallView: View {
         }
         .background(.background)
         .task { await viewModel.syncWithRouter() }
-        .onDisappear { viewModel.stopPolling() }
     }
 
     // MARK: - Idle (Dialer)

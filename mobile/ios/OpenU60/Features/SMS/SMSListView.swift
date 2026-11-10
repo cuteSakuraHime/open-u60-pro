@@ -5,6 +5,7 @@ struct SMSListView: View {
     let client: AgentClient
     let authManager: AuthManager
     @State private var showCompose = false
+    @Environment(CallViewModel.self) private var callModel
     @State private var showCall = false
     @State private var searchText = ""
 
@@ -28,6 +29,11 @@ struct SMSListView: View {
     var body: some View {
         NavigationStack {
             List {
+                if viewModel.notificationsEnabled {
+                    Text("本地通知仅在 App 前台同步且选择全部存储时提交；后台来信暂不支持提醒。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Picker("Storage", selection: Binding(
                     get: { viewModel.storageFilter },
                     set: { newValue in
@@ -96,6 +102,12 @@ struct SMSListView: View {
                 ToolbarItem(placement: .primaryAction) {
                     HStack(spacing: 24) {
                         Button {
+                            Task { await viewModel.enableNotifications() }
+                        } label: {
+                            Image(systemName: viewModel.notificationsEnabled ? "bell.fill" : "bell")
+                        }
+                        .accessibilityLabel("开启短信本地通知（App运行且显示全部存储时同步）")
+                        Button {
                             showCall = true
                         } label: {
                             Image(systemName: "phone")
@@ -129,7 +141,7 @@ struct SMSListView: View {
                 SMSComposeView(viewModel: viewModel)
             }
             .fullScreenCover(isPresented: $showCall) {
-                CallView(viewModel: CallViewModel(client: client, authManager: authManager))
+                CallView(viewModel: callModel)
             }
             .onReceive(ticker) { now = $0 }
             .task { await viewModel.refresh() }

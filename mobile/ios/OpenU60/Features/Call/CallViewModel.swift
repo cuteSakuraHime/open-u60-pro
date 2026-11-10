@@ -25,10 +25,32 @@ final class CallViewModel {
     private let authManager: AuthManager
     private let pollLoop = PollingLoop()
     private let durationLoop = PollingLoop()
+    private var connectionGeneration = 0
+
+    /// Forget local state when authentication or the router changes; never sends hangup.
+    func resetConnection() {
+        connectionGeneration += 1
+        // The router call may continue; only the local system UI is closed.
+        callKit.reportEnded()
+        history.abandon()
+        stopPolling()
+        stopDurationTimer()
+        callState = .idle
+        phoneNumber = ""
+        isMuted = false
+        showKeypad = false
+        error = nil
+    }
+
+    private let callKit = CallKitManager()
+    let history = CallHistoryStore()
 
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
         self.authManager = authManager
+        callKit.onDial = { [weak self] number in await self?.performDial(number) ?? false }
+        callKit.onAnswer = { [weak self] in await self?.performAnswer() ?? false }
+        callKit.onEnd = { [weak self] in await self?.performHangup() ?? false }
     }
 
     // MARK: - Number Input
@@ -47,39 +69,82 @@ final class CallViewModel {
 
     // MARK: - Call Actions
 
+    /// UI entry points go through CallKit so the system call UI and Recents stay in sync.
     func dial() async {
         let number = phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !number.isEmpty else { return }
         error = nil
-        callState = .dialing
-
-        do {
-            let _ = try await client.postJSON("/api/call/dial", body: ["number": number])
-            // State will be updated by polling
-            startPolling()
-        } catch {
-            callState = .idle
-            guard !error.isCancellation else { return }
-            self.error = error.localizedDescription
-            // The POST can fail client-side (timeout) after the router already placed the
-            // call, so keep polling and let the router's status decide the state.
-            startPolling()
-        }
+        callKit.startOutgoing(number: number)
     }
 
     func hangup() async {
-        error = nil
-        let _ = try? await client.postJSON("/api/call/hangup")
-        callState = .idle
-        isMuted = false
-        stopDurationTimer()
-        stopPolling()
+        if callKit.currentCall != nil {
+            callKit.requestEnd()
+        } else {
+            _ = await performHangup()
+        }
     }
 
     func answer() async {
+        if callKit.currentCall != nil {
+            callKit.requestAnswer()
+        } else {
+            _ = await performAnswer()
+        }
+    }
+
+    private func performDial(_ number: String) async -> Bool {
+        let generation = connectionGeneration
+        phoneNumber = number
+        callState = .dialing
+        do {
+            let _ = try await client.postJSON("/api/call/dial", body: ["number": number])
+            guard generation == connectionGeneration else { return false }
+            startPolling()
+            return true
+        } catch {
+            guard generation == connectionGeneration else { return false }
+            callState = .idle
+            if !error.isCancellation { self.error = error.localizedDescription }
+            // The POST can time out after the router already placed the call.
+            startPolling()
+            return false
+        }
+    }
+
+    private func performHangup() async -> Bool {
+        let generation = connectionGeneration
         error = nil
-        let _ = try? await client.postJSON("/api/call/answer")
+        var accepted = true
+        do {
+            let _ = try await client.postJSON("/api/call/hangup")
+        } catch {
+            accepted = false
+            guard generation == connectionGeneration else { return false }
+            if !error.isCancellation { self.error = "挂断尚未确认：\(error.localizedDescription)" }
+        }
+        guard generation == connectionGeneration else { return false }
+        // A successful command is not proof the modem released the call.
+        _ = await pollCallStatus()
+        guard generation == connectionGeneration else { return false }
         startPolling()
+        return accepted
+    }
+
+    private func performAnswer() async -> Bool {
+        let generation = connectionGeneration
+        error = nil
+        do {
+            let _ = try await client.postJSON("/api/call/answer")
+            guard generation == connectionGeneration else { return false }
+            startPolling()
+            return true
+        } catch {
+            guard generation == connectionGeneration else { return false }
+            if !error.isCancellation { self.error = "接听尚未确认：\(error.localizedDescription)" }
+            startPolling()
+            return false
+        }
     }
 
     func sendDTMF(_ digits: String) async {
@@ -87,9 +152,11 @@ final class CallViewModel {
     }
 
     func toggleMute() async {
+        let generation = connectionGeneration
         let newMuted = !isMuted
         do {
             let result = try await client.postJSON("/api/call/mute", body: ["enabled": newMuted])
+            guard generation == connectionGeneration else { return }
             if let muted = result["muted"] as? Bool {
                 isMuted = muted
             } else {
@@ -109,18 +176,16 @@ final class CallViewModel {
         }
     }
 
-    /// Stops status polling without touching the call itself. Dismissing the screen
-    /// leaves an active call up on the router, exactly as before.
+    /// The app lifecycle controls polling; closing the dialer does not stop it.
+    /// Suspending polling never hangs up a router call.
     func stopPolling() {
         pollLoop.stop()
     }
 
     /// One-shot reconciliation when the screen appears.
     ///
-    /// Closing the call screen leaves an active call up on the router but tears down this view
-    /// model, so re-opening it would otherwise show an idle dial pad with no way to reach a call
-    /// that is still connected. Poll once to find out, and only stay polling if there is something
-    /// to watch — an idle dialer has no reason to hit the router every two seconds.
+    /// The shared model survives dismissal. If lifecycle polling has not started,
+    /// reconcile once so an existing router call remains controllable.
     func syncWithRouter() async {
         guard !pollLoop.isRunning else { return }
         _ = await pollCallStatus()
@@ -128,6 +193,7 @@ final class CallViewModel {
     }
 
     private func pollCallStatus() async -> PollingLoop.Outcome {
+        let generation = connectionGeneration
         let result: [String: Any]
         do {
             result = try await client.getJSON("/api/call/status")
@@ -135,7 +201,13 @@ final class CallViewModel {
             return error.isCancellation ? .success : .failure
         }
 
-        guard let calls = result["calls"] as? [[String: Any]] else { return .success }
+        guard !Task.isCancelled, generation == connectionGeneration else { return .success }
+        guard let listedCalls = result["calls"] as? [[String: Any]] else { return .failure }
+        // MiFi firmware also lists persistent data/fax bearers in CLCC.
+        let calls = listedCalls.filter { call in
+            let mode = (call["mode"] as? Int) ?? Int(call["mode"] as? String ?? "")
+            return mode != 1 && mode != 2
+        }
 
         if calls.isEmpty {
             if callState != .idle {
@@ -143,6 +215,9 @@ final class CallViewModel {
                 isMuted = false
                 stopDurationTimer()
             }
+            // Only a complete router status clears the system call.
+            callKit.reportEnded()
+            history.finish()
             return .success
         }
 
@@ -151,6 +226,10 @@ final class CallViewModel {
 
         let number = first["number"] as? String ?? ""
         let dir = first["dir"] as? String ?? "mo"
+
+        if ["dialing", "alerting", "active", "incoming", "waiting"].contains(stat) {
+            history.begin(number: number, direction: dir == "mt" ? .incoming : .outgoing)
+        }
 
         switch stat {
         case "dialing":
@@ -162,14 +241,20 @@ final class CallViewModel {
                 callState = .active
                 startDurationTimer()
             }
+            callKit.reportConnected()
+            history.markConnected()
         case "incoming", "waiting":
-            callState = .incoming(from: number.isEmpty ? (dir == "mt" ? "Unknown" : number) : number)
+            let caller = number.isEmpty ? (dir == "mt" ? "Unknown" : number) : number
+            callState = .incoming(from: caller)
+            callKit.reportIncoming(number: caller)
         case "held":
             break // keep current state
         case "releasing":
             callState = .idle
             isMuted = false
             stopDurationTimer()
+            callKit.reportEnded()
+            history.finish()
         default:
             break
         }

@@ -1,10 +1,27 @@
 import SwiftUI
+import UserNotifications
+
+/// Retained for the process lifetime because notification center's delegate is weak.
+private final class LocalSMSNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = LocalSMSNotificationDelegate()
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        guard notification.request.content.categoryIdentifier == "local-router-sms" else {
+            completionHandler([])
+            return
+        }
+        completionHandler([.banner, .list, .sound])
+    }
+}
 
 @main
 struct OpenU60App: App {
     @State private var signalActivity: SignalActivityManager
     @Environment(\.scenePhase) private var scenePhase
     @State private var authManager: AuthManager
+    @State private var callModel: CallViewModel
     @State private var isAttemptingAutoLogin = true
     @AppStorage("gateway_ip") private var gatewayIP: String = "192.168.0.1"
     @AppStorage("dark_mode_override") private var darkModeOverride: Int = 0
@@ -12,11 +29,14 @@ struct OpenU60App: App {
     private let client: AgentClient
 
     init() {
+        UNUserNotificationCenter.current().delegate = LocalSMSNotificationDelegate.shared
         let savedIP = UserDefaults.standard.string(forKey: "gateway_ip") ?? "192.168.0.1"
         let agentClient = AgentClient(baseURL: "http://\(savedIP):9090")
         self.client = agentClient
         _signalActivity = State(initialValue: SignalActivityManager(client: agentClient))
-        _authManager = State(initialValue: AuthManager(client: agentClient))
+        let authentication = AuthManager(client: agentClient)
+        _authManager = State(initialValue: authentication)
+        _callModel = State(initialValue: CallViewModel(client: agentClient, authManager: authentication))
 
         let navAppearance = UINavigationBarAppearance()
         navAppearance.configureWithTransparentBackground()
@@ -34,6 +54,39 @@ struct OpenU60App: App {
         WindowGroup {
             rootView
                 .environment(signalActivity)
+                .environment(callModel)
+                .overlay(alignment: .top) {
+                    if authManager.isAuthenticated,
+                       case .incoming(let number) = callModel.callState {
+                        VStack(spacing: 12) {
+                            Text("来电：\(number)").font(.headline)
+                            HStack(spacing: 32) {
+                                Button("拒接", role: .destructive) {
+                                    Task { await callModel.hangup() }
+                                }
+                                Button("接听") {
+                                    Task { await callModel.answer() }
+                                }
+                            }
+                            if let error = callModel.error {
+                                Text(error).font(.caption).foregroundStyle(.red)
+                            }
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                        .padding()
+                    }
+                }
+                .task(id: authManager.isAuthenticated && scenePhase == .active) {
+                    if authManager.isAuthenticated && scenePhase == .active {
+                        callModel.startPolling()
+                    } else if !authManager.isAuthenticated {
+                        callModel.resetConnection()
+                    } else {
+                        callModel.stopPolling()
+                    }
+                }
                 .task(id: authManager.isAuthenticated) {
                     if authManager.isAuthenticated { await signalActivity.resume() }
                     else if signalActivity.activity != nil { await signalActivity.stop() }
@@ -46,10 +99,12 @@ struct OpenU60App: App {
                 .tint(.blue)
                 .preferredColorScheme(colorScheme)
                 .onChange(of: gatewayIP) {
-                    Task {
-                        await signalActivity.stop()
-                        client.baseURL = "http://\(gatewayIP):9090"
+                    callModel.resetConnection()
+                    client.baseURL = "http://\(gatewayIP):9090"
+                    if authManager.isAuthenticated && scenePhase == .active {
+                        callModel.startPolling()
                     }
+                    Task { await signalActivity.stop() }
                 }
         }
     }

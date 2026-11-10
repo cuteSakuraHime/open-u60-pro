@@ -1,5 +1,6 @@
 import SwiftUI
 import os
+import UserNotifications
 
 private let logger = Logger(subsystem: "com.zte.companion", category: "SMS")
 
@@ -20,6 +21,54 @@ final class SMSViewModel {
     var isSending = false
     var error: String?
 
+    private let polling = PollingLoop()
+    private var refreshPending = false
+    private var arrivals = SMSArrivalTracker()
+    var notificationsEnabled = false
+
+    func enableNotifications() async {
+        do {
+            notificationsEnabled = try await UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert, .sound, .badge])
+            if !notificationsEnabled { error = "通知未获授权，请在系统设置中开启。" }
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func notifyArrivals(_ messages: [SMSMessage]) async {
+        let fresh = arrivals.ingest(messages)
+        guard notificationsEnabled else { return }
+        for message in fresh {
+            let content = UNMutableNotificationContent()
+            content.categoryIdentifier = "local-router-sms"
+            content.title = "收到新短信"
+            content.body = "来自 \(message.number)，打开 App 查看内容与验证码。"
+            content.sound = .default
+            // Keep SMS content and OTPs out of notification payloads.
+            let request = UNNotificationRequest(identifier: UUID().uuidString,
+                                                content: content, trigger: nil)
+            do {
+                try await UNUserNotificationCenter.current().add(request)
+            } catch {
+                logger.error("Local SMS notification failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func startPolling() {
+        guard !polling.isRunning else { return }
+        polling.start(interval: .seconds(5)) { [weak self] in
+            guard let self else { return .success }
+            await self.refresh()
+            return self.error == nil ? .success : .failure
+        }
+    }
+
+    func stopPolling() {
+        polling.stop()
+    }
+
     private let client: AgentClient
     private let authManager: AuthManager
 
@@ -31,6 +80,12 @@ final class SMSViewModel {
     // MARK: - Fetch
 
     func refresh() async {
+        guard !isLoading else {
+            refreshPending = true
+            return
+        }
+        refreshPending = false
+        let requestedFilter = storageFilter
         isLoading = true
         error = nil
 
@@ -38,9 +93,15 @@ final class SMSViewModel {
         async let capacityResult = self.fetchCapacity()
         let messages = await fetchMessages()
 
-        if let messages {
+        if let messages, requestedFilter == storageFilter, !Task.isCancelled {
             allMessages = messages
             conversations = SMSParser.groupIntoConversations(messages)
+            if requestedFilter == .all {
+                await notifyArrivals(messages)
+            } else {
+                // A filtered list cannot safely establish a global arrival baseline.
+                arrivals.reset()
+            }
         }
 
         if let cap = await capacityResult {
@@ -48,6 +109,9 @@ final class SMSViewModel {
         }
 
         isLoading = false
+        if !Task.isCancelled && (refreshPending || requestedFilter != storageFilter) {
+            await refresh()
+        }
     }
 
     private func fetchMessages() async -> [SMSMessage]? {

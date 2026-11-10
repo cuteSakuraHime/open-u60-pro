@@ -121,7 +121,7 @@ pub(crate) fn parse_clcc(raw: &str) -> Vec<Value> {
     let mut calls = Vec::new();
     for line in raw.lines() {
         // +CLCC: idx,dir,stat,mode,mpty[,"number",type]
-        let Some(rest) = line.strip_prefix("+CLCC:") else {
+        let Some(rest) = line.trim().strip_prefix("+CLCC:") else {
             continue;
         };
         let rest = rest.trim();
@@ -134,7 +134,7 @@ pub(crate) fn parse_clcc(raw: &str) -> Vec<Value> {
         let stat_i: usize = parts[2].trim().parse().unwrap_or(0);
         let mode: i64 = parts[3].trim().parse().unwrap_or(0);
         let number = if parts.len() > 5 {
-            parts[5].trim().trim_matches('"').to_string()
+            parts[5].trim().split(',').next().unwrap_or("").trim().trim_matches('"').to_string()
         } else {
             String::new()
         };
@@ -262,18 +262,41 @@ pub fn call_answer(state: &AppState) -> (u16, Value) {
     }
 }
 
+/// Return only voice/unknown bearers, and never turn a partial or malformed
+/// CLCC transaction into a confirmed idle state.
+fn voice_call_snapshot(resp: &str) -> Result<Vec<Value>, &'static str> {
+    if resp.lines().filter(|line| !line.trim().is_empty()).last().map(str::trim) != Some("OK") {
+        return Err("incomplete call status response");
+    }
+    for line in resp.lines().map(str::trim) {
+        if let Some(fields) = line.strip_prefix("+CLCC:") {
+            let fields: Vec<&str> = fields.splitn(6, ',').collect();
+            if fields.len() < 5 {
+                return Err("malformed call status response");
+            }
+            let numeric: Option<Vec<u32>> = fields[..5].iter()
+                .map(|value| value.trim().parse::<u32>().ok()).collect();
+            match numeric {
+                Some(values) if values[0] > 0 && values[1] <= 1 && values[2] <= 6
+                    && values[3] <= 9 && values[4] <= 1 => {}
+                _ => return Err("malformed call status response"),
+            }
+        }
+    }
+    Ok(parse_clcc(resp).into_iter()
+        .filter(|call| !matches!(call["mode"].as_i64(), Some(1) | Some(2)))
+        .collect())
+}
+
 /// GET /api/call/status
 pub fn call_status(state: &AppState) -> (u16, Value) {
     match at_cmd::send(&state.at_port, "AT+CLCC", 2) {
         Ok(resp) => {
-            let calls = parse_clcc(&resp);
-            // Fail closed: the AT node can hand a reply to another reader, so
-            // only a terminal OK with no +CLCC line proves there is no call.
-            if !calls.is_empty() {
-                state.call_active.store(true, Ordering::Relaxed);
-            } else if resp.contains("OK") {
-                state.call_active.store(false, Ordering::Relaxed);
-            }
+            let calls = match voice_call_snapshot(&resp) {
+                Ok(calls) => calls,
+                Err(error) => return (503, json!({"ok": false, "error": error})),
+            };
+            state.call_active.store(!calls.is_empty(), Ordering::Relaxed);
             (200, json!({"ok": true, "data": {"calls": calls}}))
         }
         Err(e) => (503, json!({"ok": false, "error": e})),
@@ -410,6 +433,34 @@ pub fn ussd_cancel(state: &AppState) -> (u16, Value) {
 /// GET /api/stk/menu — Qualcomm RIL session snapshot.
 pub fn stk_menu(state: &AppState) -> (u16, Value) {
     state.stk.request("menu", &[])
+}
+
+#[cfg(test)]
+mod call_snapshot_tests {
+    use super::voice_call_snapshot;
+
+    #[test]
+    fn data_bearers_do_not_mask_a_voice_call() {
+        let calls = voice_call_snapshot(concat!(
+            "AT+CLCC\r\n",
+            "+CLCC: 1,0,0,1,0,\"\",128\r\n",
+            "+CLCC: 2,1,0,1,0,\"\",128\r\n",
+            "  +CLCC: 3,0,3,0,0,\"123456\",129\r\nOK\r\n"
+        )).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["number"], "123456");
+        assert_eq!(calls[0]["stat"], "alerting");
+    }
+
+    #[test]
+    fn only_complete_valid_responses_confirm_idle() {
+        assert!(voice_call_snapshot("AT+CLCC\r\nOK\r\n").unwrap().is_empty());
+        assert!(voice_call_snapshot("+CLCC: 1,0,0,1,0,\"\",128\r\nOK\r\n").unwrap().is_empty());
+        for raw in ["", "AT+CLCC\r\n", "ERROR\r\n", "+CLCC: 1,0\r\nOK\r\n",
+                    "+CLCC: 1,0,bad,0,0\r\nOK\r\n", "OK\r\nERROR\r\n"] {
+            assert!(voice_call_snapshot(raw).is_err(), "accepted {raw:?}");
+        }
+    }
 }
 
 /// POST /api/stk/select — requires item_id and command_id from the current snapshot.

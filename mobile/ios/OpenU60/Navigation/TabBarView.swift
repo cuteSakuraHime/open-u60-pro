@@ -39,6 +39,7 @@ struct TabBarView: View {
                 .tabItem {
                     Label("SMS", systemImage: "message")
                 }
+                .badge(smsVM.capacity.unreadCount)
                 .tag(Tab.sms)
 
             ToolsListView(client: client, authManager: authManager)
@@ -73,12 +74,17 @@ struct TabBarView: View {
                 usbVM.stopPolling()
             }
         }
+        .onChange(of: smsPollingActive, initial: true) { _, active in
+            if active { smsVM.startPolling() } else { smsVM.stopPolling() }
+        }
         .onAppear {
+            if smsPollingActive { smsVM.startPolling() }
             // Reappearing with an unchanged poll key must resume loops stopped on disappear.
             if dashboardPollKey.active { dashboardVM.startPolling(interval: pollInterval) }
             if isForeground { usbVM.startPolling() }
         }
         .onDisappear {
+            smsVM.stopPolling()
             dashboardVM.stopPolling()
             usbVM.stopPolling()
         }
@@ -94,6 +100,7 @@ struct TabBarView: View {
     /// user can read is on screen; the cost is one extra immediate refresh when a short Control
     /// Centre pull ends, which is what a returning user wants anyway.
     private var isForeground: Bool { scenePhase == .active }
+    private var smsPollingActive: Bool { isForeground && authManager.isAuthenticated }
 
     /// Restarting on any change of this key preserves the previous behaviour: the loop restarts
     /// when the configured interval changes and stops when the dashboard is not on screen.

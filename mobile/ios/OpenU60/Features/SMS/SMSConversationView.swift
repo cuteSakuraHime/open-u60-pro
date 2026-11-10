@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SMSConversationView: View {
     var viewModel: SMSViewModel
@@ -105,6 +106,7 @@ struct SMSConversationView: View {
 private struct SMSBubbleView: View {
     let message: SMSMessage
 
+    @State private var copiedCode = false
     private var isOutgoing: Bool { !message.tag.isIncoming }
 
     var body: some View {
@@ -117,6 +119,22 @@ private struct SMSBubbleView: View {
                     .padding(.vertical, 8)
                     .background(bubbleColor, in: RoundedRectangle(cornerRadius: 16))
                     .foregroundStyle(isOutgoing ? .white : .primary)
+
+                if let code = message.verificationCode {
+                    Button {
+                        UIPasteboard.general.setItems(
+                            [[UIPasteboard.typeAutomatic: code]],
+                            options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)]
+                        )
+                        copiedCode = true
+                    } label: {
+                        Label(copiedCode ? "已复制验证码" : "复制验证码 \(code)",
+                              systemImage: copiedCode ? "checkmark" : "doc.on.doc")
+                            .font(.callout)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.borderless)
+                }
 
                 HStack(spacing: 4) {
                     if message.tag == .failed {

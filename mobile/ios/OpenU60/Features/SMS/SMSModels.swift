@@ -38,6 +38,50 @@ struct SMSMessage: Identifiable, Sendable {
     let tag: SMSTag
     let groupId: String
     let memStore: String
+
+    var verificationCode: String? {
+        guard tag.isIncoming else { return nil }
+        return SMSParser.verificationCode(in: content)
+    }
+}
+
+/// Session-scoped notification baseline. Feed only complete, unfiltered snapshots.
+struct SMSArrivalTracker {
+    private struct Key: Hashable {
+        let id: Int
+        let storage: String
+        let sender: String
+        let date: Date
+        let content: String
+
+        init(_ message: SMSMessage) {
+            id = message.id
+            storage = message.memStore
+            sender = message.number
+            date = message.date
+            content = message.content
+        }
+    }
+
+    private var seen: Set<Key>? = nil
+
+    mutating func ingest(_ messages: [SMSMessage]) -> [SMSMessage] {
+        let current = Set(messages.map(Key.init))
+        guard let previous = seen else {
+            seen = current
+            return []
+        }
+        // Keep a session history so temporarily missing records do not notify twice.
+        seen = previous.union(current)
+        var emitted = Set<Key>()
+        return messages.filter { message in
+            let key = Key(message)
+            return message.tag == .unread && !previous.contains(key)
+                && emitted.insert(key).inserted
+        }
+    }
+
+    mutating func reset() { seen = nil }
 }
 
 // MARK: - SMS Conversation
@@ -67,6 +111,35 @@ struct SMSCapacity: Sendable {
 // MARK: - Parser
 
 enum SMSParser {
+
+    /// Only surface an unambiguous numeric code near an explicit OTP keyword.
+    /// Do not guess between multiple codes or extract digits from a phone number.
+    static func verificationCode(in text: String) -> String? {
+        let keyword = #"(?:验证码|校验码|动态码|驗證碼|(?i:\bOTP\b|\bverification\s+code\b|\bsecurity\s+code\b|\bone[- ]time\s+(?:password|code)\b))"#
+        let code = #"(?<![A-Za-z\p{N}])[0-9]{4,8}(?![A-Za-z\p{N}])"#
+        guard let keywords = try? NSRegularExpression(pattern: keyword),
+              let codes = try? NSRegularExpression(pattern: code) else { return nil }
+        let range = NSRange(text.startIndex..., in: text)
+        let anchors = keywords.matches(in: text, range: range)
+        let candidates = codes.matches(in: text, range: range).filter { candidate in
+            anchors.contains { anchor in
+                let gap: NSRange
+                if NSMaxRange(anchor.range) <= candidate.range.location {
+                    gap = NSRange(location: NSMaxRange(anchor.range), length: candidate.range.location - NSMaxRange(anchor.range))
+                } else if NSMaxRange(candidate.range) <= anchor.range.location {
+                    gap = NSRange(location: NSMaxRange(candidate.range), length: anchor.range.location - NSMaxRange(candidate.range))
+                } else {
+                    return false
+                }
+                guard gap.length <= 16, let between = Range(gap, in: text) else { return false }
+                return text[between].rangeOfCharacter(from: CharacterSet(charactersIn: "0123456789。.!?！？\\n")) == nil
+            }
+        }
+        let values = Set(candidates.compactMap { match in
+            Range(match.range, in: text).map { String(text[$0]) }
+        })
+        return values.count == 1 ? values.first : nil
+    }
 
     // MARK: Shared immutable helpers
 
