@@ -1,0 +1,67 @@
+name: iOS IPA
+
+# Unsigned IPA for sideloading (Sideloadly/AltStore re-sign with the user's Apple ID).
+# Manual runs keep the IPA as an artifact; `ios-*` tags also publish a pre-release.
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ['ios-*']
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install xcodegen
+          xcodebuild -version
+
+      - name: Offline tests
+        run: |
+          sh scripts/test-ios-duo.sh
+          sh scripts/test-sms-forward.sh
+
+      - name: Build unsigned app
+        working-directory: mobile/ios/OpenU60
+        env:
+          DEVELOPMENT_TEAM: ""
+          BUNDLE_ID_PREFIX: dev.local.openu60
+        run: |
+          xcodegen generate --quiet
+          xcodebuild -project OpenU60.xcodeproj -scheme OpenU60 -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -quiet build
+
+      - name: Package IPA
+        run: |
+          SHORT=$(git rev-parse --short HEAD)
+          NAME="OpenU60-1.0-$SHORT-unsigned.ipa"
+          APP=mobile/ios/OpenU60/build/Build/Products/Release-iphoneos/OpenU60.app
+          test -d "$APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry "$NAME" Payload && rm -rf Payload && shasum -a 256 "$NAME" > SHA256SUMS)
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenU60-unsigned-ipa
+          path: out/*
+          retention-days: 14
+
+      - name: Publish pre-release
+        if: startsWith(github.ref, 'refs/tags/ios-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          prerelease: true
+          make_latest: false
+          body: |
+            未签名 IPA，从 ${{ github.sha }} 编译。用 Sideloadly / AltStore 以自己的 Apple ID 重签名后侧载。
+            免费 Apple ID 会去掉推送/VoIP 能力，锁屏来电提醒需要付费开发者账号。
