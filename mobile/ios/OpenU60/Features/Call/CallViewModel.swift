@@ -73,10 +73,28 @@ final class CallViewModel {
         }
         do {
             try voice.start(router: host, recordTo: url)
+            // Outgoing calls activate audio before they connect; the poll starts
+            // the router bridge once the call is active.
+            if callState == .active { Task { await startRouterAudio() } }
         } catch {
             voice.stop()
             logger.error("Voice stream failed: \(error.localizedDescription, privacy: .public)")
             self.error = "通话音频启动失败"
+        }
+    }
+
+    /// Ask the router to stream the active call to this phone. Retried by the
+    /// status poll until the router reports its bridge running.
+    private func startRouterAudio() async {
+        guard let router = URL(string: client.baseURL)?.host,
+              let phone = VoiceStream.wifiAddress(sameSubnetAs: router) else {
+            error = "未连接到路由器 Wi-Fi，无法传输通话声音"
+            return
+        }
+        do {
+            _ = try await client.postJSON("/api/call/audio/start", body: ["host": phone])
+        } catch {
+            logger.error("Router audio start failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -270,6 +288,10 @@ final class CallViewModel {
             }
             callKit.reportConnected()
             history.markConnected()
+            let audio = result["audio"] as? [String: Any]
+            if voice.isRunning, (audio?["running"] as? Bool) != true {
+                await startRouterAudio()
+            }
         case "incoming", "waiting":
             let caller = number.isEmpty ? (dir == "mt" ? "Unknown" : number) : number
             callState = .incoming(from: caller)

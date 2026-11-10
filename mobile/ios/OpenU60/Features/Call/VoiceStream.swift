@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Network
 
 /// Two-way call audio with the router's vendor RTP bridge (PCMU over UDP 48894).
@@ -20,6 +21,25 @@ final class VoiceStream {
     private var recorder: CallRecorder?
     private(set) var isRunning = false
     var isMuted = false
+
+    /// This phone's IPv4 on the Wi-Fi interface that shares a /24 with the router;
+    /// the router's bridge sends call audio here.
+    static func wifiAddress(sameSubnetAs router: String) -> String? {
+        let prefix = router.split(separator: ".").prefix(3).joined(separator: ".") + "."
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { freeifaddrs(head) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: ptr.pointee.ifa_name).hasPrefix("en") else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let address = String(cString: host)
+            if address.hasPrefix(prefix), address != router { return address }
+        }
+        return nil
+    }
 
     func start(router: String, recordTo url: URL?) throws {
         guard !isRunning else { return }

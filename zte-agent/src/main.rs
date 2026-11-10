@@ -47,6 +47,7 @@ mod stk;
 mod system;
 mod tailscale;
 mod telephony;
+mod voice_bridge;
 mod tls;
 mod ttl;
 mod ubus;

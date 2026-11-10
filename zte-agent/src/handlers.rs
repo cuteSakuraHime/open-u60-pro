@@ -39,6 +39,8 @@ pub struct AppState {
     /// A voice call is (believed to be) in progress; set by the telephony
     /// handlers, re-checked with `AT+CLCC` by the policies' busy guard.
     pub call_active: std::sync::atomic::AtomicBool,
+    /// Vendor RTP bridge streaming the active call to one LAN phone (see voice_bridge.rs).
+    pub voice_bridge: crate::voice_bridge::VoiceBridge,
     /// Unix seconds of the last USSD prompt that still needs a reply (0 = none).
     pub ussd_prompt_at: std::sync::atomic::AtomicU64,
     /// Tracks the active SIM's identity across profile switches and swaps (see sim_identity.rs).
@@ -80,6 +82,7 @@ impl AppState {
             oos_policy: Arc::new(crate::oos_policy::OosPolicy::new()),
             conn_watchdog: Arc::new(crate::conn_watchdog::ConnWatchdog::new()),
             call_active: std::sync::atomic::AtomicBool::new(false),
+            voice_bridge: crate::voice_bridge::VoiceBridge::default(),
             ussd_prompt_at: std::sync::atomic::AtomicU64::new(0),
             sim_identity: Arc::new(crate::sim_identity::SimIdentity::new()),
             hub: Arc::new(crate::events::Hub::new(Arc::new(crate::boottime::BootClock))),

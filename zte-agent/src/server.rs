@@ -435,6 +435,9 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Get, "/api/call/status") => telephony::call_status(state),
         (&Method::Post, "/api/call/dtmf") => telephony::call_dtmf(state, body),
         (&Method::Post, "/api/call/mute") => telephony::call_mute(state, body),
+        (&Method::Post, "/api/call/audio/start") => telephony::call_audio_start(state, body),
+        (&Method::Post, "/api/call/audio/stop") => telephony::call_audio_stop(state),
+        (&Method::Get, "/api/call/audio") => (200, json!({"ok": true, "data": state.voice_bridge.status()})),
         // Telephony — USSD
         (&Method::Post, "/api/ussd/send") => telephony::ussd_send(state, body),
         (&Method::Post, "/api/ussd/respond") => telephony::ussd_respond(state, body),

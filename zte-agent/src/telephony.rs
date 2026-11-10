@@ -240,6 +240,7 @@ pub fn call_dial(state: &AppState, body: &[u8]) -> (u16, Value) {
 
 /// POST /api/call/hangup
 pub fn call_hangup(state: &AppState) -> (u16, Value) {
+    state.voice_bridge.stop();
     match at_cmd::send(&state.at_port, "AT+CHUP", 3) {
         Ok(_) => {
             state.call_active.store(false, Ordering::Relaxed);
@@ -297,7 +298,12 @@ pub fn call_status(state: &AppState) -> (u16, Value) {
                 Err(error) => return (503, json!({"ok": false, "error": error})),
             };
             state.call_active.store(!calls.is_empty(), Ordering::Relaxed);
-            (200, json!({"ok": true, "data": {"calls": calls}}))
+            // A complete status with no voice call means the call ended remotely.
+            if calls.is_empty() {
+                state.voice_bridge.stop();
+            }
+            let audio = state.voice_bridge.status();
+            (200, json!({"ok": true, "data": {"calls": calls, "audio": audio}}))
         }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
@@ -326,6 +332,39 @@ pub fn call_dtmf(state: &AppState, body: &[u8]) -> (u16, Value) {
         Ok(_) => (200, json!({"ok": true, "data": {"status": "ok"}})),
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
+}
+
+/// POST /api/call/audio/start — body: {"host": "<phone LAN IPv4>"}
+/// Streams the active call to that phone (PCMU RTP, UDP 48894). Requires an
+/// active voice call so the bridge never holds the audio path while idle.
+pub fn call_audio_start(state: &AppState, body: &[u8]) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
+    };
+    let Some(host) = parsed["host"].as_str().and_then(|h| h.parse::<std::net::Ipv4Addr>().ok()) else {
+        return (400, json!({"ok": false, "error": "host must be an IPv4 address"}));
+    };
+    let active = match at_cmd::send(&state.at_port, "AT+CLCC", 2) {
+        Ok(resp) => match voice_call_snapshot(&resp) {
+            Ok(calls) => calls.iter().any(|c| c["stat"] == "active"),
+            Err(e) => return (503, json!({"ok": false, "error": e})),
+        },
+        Err(e) => return (503, json!({"ok": false, "error": e})),
+    };
+    if !active {
+        return (409, json!({"ok": false, "error": "no active voice call"}));
+    }
+    match state.voice_bridge.start(host) {
+        Ok(()) => (200, json!({"ok": true, "data": state.voice_bridge.status()})),
+        Err(e) => (500, json!({"ok": false, "error": e})),
+    }
+}
+
+/// POST /api/call/audio/stop
+pub fn call_audio_stop(state: &AppState) -> (u16, Value) {
+    state.voice_bridge.stop();
+    (200, json!({"ok": true, "data": state.voice_bridge.status()}))
 }
 
 /// POST /api/call/mute — body: {"enabled": true/false}
