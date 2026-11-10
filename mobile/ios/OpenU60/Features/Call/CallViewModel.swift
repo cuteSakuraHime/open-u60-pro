@@ -32,6 +32,7 @@ final class CallViewModel {
         connectionGeneration += 1
         // The router call may continue; only the local system UI is closed.
         callKit.reportEnded()
+        voice.stop()
         history.abandon()
         stopPolling()
         stopDurationTimer()
@@ -43,7 +44,12 @@ final class CallViewModel {
     }
 
     private let callKit = CallKitManager()
+    private let voice = VoiceStream()
     let history = CallHistoryStore()
+    /// Recording is opt-in; recordings stay in Application Support on this phone.
+    var recordCalls = UserDefaults.standard.bool(forKey: "recordCalls") {
+        didSet { UserDefaults.standard.set(recordCalls, forKey: "recordCalls") }
+    }
 
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
@@ -51,6 +57,27 @@ final class CallViewModel {
         callKit.onDial = { [weak self] number in await self?.performDial(number) ?? false }
         callKit.onAnswer = { [weak self] in await self?.performAnswer() ?? false }
         callKit.onEnd = { [weak self] in await self?.performHangup() ?? false }
+        callKit.onAudioActivated = { [weak self] in self?.startVoice() }
+        callKit.onAudioDeactivated = { [weak self] in self?.voice.stop() }
+        callKit.onMute = { [weak self] muted in self?.voice.isMuted = muted }
+    }
+
+    private func startVoice() {
+        guard let host = URL(string: client.baseURL)?.host else { return }
+        var url: URL?
+        if recordCalls {
+            let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Recordings", isDirectory: true)
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            url = folder.appendingPathComponent("call-\(stamp).wav")
+        }
+        do {
+            try voice.start(router: host, recordTo: url)
+        } catch {
+            voice.stop()
+            logger.error("Voice stream failed: \(error.localizedDescription, privacy: .public)")
+            self.error = "通话音频启动失败"
+        }
     }
 
     // MARK: - Number Input

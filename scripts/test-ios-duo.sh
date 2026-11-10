@@ -29,4 +29,8 @@ swiftc -module-cache-path "$test_dir/cache" "$history" "$test_dir/main.swift" -o
 cp mobile/ios/Tests/CallAudioTests.swift "$test_dir/main.swift"
 swiftc -module-cache-path "$test_dir/cache" "$call/CallAudio.swift" "$test_dir/main.swift" -o "$test_dir/audio"
 "$test_dir/audio"
+cp mobile/ios/Tests/VoiceJitterTests.swift "$test_dir/main.swift"
+swiftc -module-cache-path "$test_dir/cache" "$call/CallAudio.swift" "$call/VoiceJitter.swift" \
+    "$test_dir/main.swift" -o "$test_dir/jitter"
+"$test_dir/jitter"
 echo "All Duo tests passed"

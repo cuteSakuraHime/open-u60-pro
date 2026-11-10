@@ -17,6 +17,10 @@ struct CallView: View {
             HStack {
                 Button("通话记录") { showHistory = true }
                     .padding()
+                Toggle("录音", isOn: Bindable(viewModel).recordCalls)
+                    .toggleStyle(.button)
+                    .disabled(viewModel.callState != .idle)
+                    .accessibilityHint("下次通话开始时生效，录音只保存在本机")
                 Spacer()
                 Button("Close") { dismiss() }
                     .padding()

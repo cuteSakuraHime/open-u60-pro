@@ -1,3 +1,4 @@
+import AVFoundation
 import CallKit
 import Foundation
 
@@ -9,6 +10,10 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     var onAnswer: (() async -> Bool)?
     var onEnd: (() async -> Bool)?
     var onDial: ((String) async -> Bool)?
+    /// CallKit owns the audio session: start/stop media only from these callbacks.
+    var onAudioActivated: (() -> Void)?
+    var onAudioDeactivated: (() -> Void)?
+    var onMute: ((Bool) -> Void)?
 
     private let provider: CXProvider
     private let controller = CXCallController()
@@ -24,6 +29,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         configuration.supportedHandleTypes = [.phoneNumber]
         configuration.includesCallsInRecents = true
         provider = CXProvider(configuration: configuration)
+        // Voice chat mode enables the system echo canceller for the VoIP path.
+        try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat,
+                                                          options: [.allowBluetooth])
         super.init()
         provider.setDelegate(self, queue: nil)
     }
@@ -105,6 +113,20 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 action.fail()
             }
         }
+    }
+
+    nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        Task { @MainActor in self.onAudioActivated?() }
+    }
+
+    nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        Task { @MainActor in self.onAudioDeactivated?() }
+    }
+
+    nonisolated func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
+        let muted = action.isMuted
+        Task { @MainActor in self.onMute?(muted) }
+        action.fulfill()
     }
 
     nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
