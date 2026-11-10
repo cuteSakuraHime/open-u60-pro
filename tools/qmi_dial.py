@@ -36,15 +36,43 @@ def at(token, command):
     return text
 
 
+def voice_ports(lookup_output):
+    """Modem-side (node 3) QRTR ports for QMI service 9 (voice)."""
+    return [int(f[4]) for f in (line.split() for line in lookup_output.splitlines())
+            if len(f) >= 5 and f[0] == "9" and f[3] == "3" and f[4].isdigit()]
+
+
+_voice_port = None
+
+
+def voice_port():
+    """QRTR ports are reassigned on every boot (seen 64 and 65), so look them up."""
+    global _voice_port
+    if _voice_port is None:
+        out = subprocess.run(
+            [ADB, "shell", "qrtr-lookup >/tmp/qrtr.txt 2>/dev/null & sleep 2; kill $! 2>/dev/null; cat /tmp/qrtr.txt"],
+            capture_output=True, timeout=15, check=True,
+        ).stdout.decode("utf-8", "replace")
+        ports = voice_ports(out)
+        if len(ports) != 1:
+            raise RuntimeError(f"Expected one modem voice service, found {len(ports)}")
+        _voice_port = ports[0]
+        print(f"QMI voice service on QRTR port {_voice_port}", flush=True)
+    return _voice_port
+
+
 def qmi(message, body):
     result = subprocess.run(
-        [sys.executable, str(ROOT / "nas_get.py"), "65", message, body.hex()],
+        [sys.executable, str(ROOT / "nas_get.py"), str(voice_port()), message, body.hex()],
         capture_output=True, text=True, timeout=40, check=False,
     )
     print(result.stdout, flush=True)
     if result.returncode:
         print(result.stderr, flush=True)
         raise RuntimeError(f"QMI helper failed with exit code {result.returncode}")
+    sent = re.search(r"^send (-?\d+)", result.stdout, re.M)
+    if not sent or int(sent.group(1)) <= 0:
+        raise RuntimeError("QMI request was not sent")
     return result.stdout
 
 

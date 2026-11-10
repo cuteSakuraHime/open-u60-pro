@@ -4,6 +4,17 @@ from unittest.mock import patch
 import qmi_dial
 
 
+class VoicePortTests(unittest.TestCase):
+    def test_picks_modem_voice_service_only(self):
+        lookup = ("  Service Version Instance Node  Port\n"
+                  "       49       1        1    2 16392 IPA control service\n"
+                  "        9       2        0    3    64 Voice service\n"
+                  "        3       1        0    3    66 Network Access Service\n")
+        self.assertEqual(qmi_dial.voice_ports(lookup), [64])
+        self.assertEqual(qmi_dial.voice_ports(lookup.replace(" 64 ", " 65 ")), [65])
+        self.assertEqual(qmi_dial.voice_ports("        9       2        0    1    64 x\n"), [])
+
+
 class CleanupTests(unittest.TestCase):
     @patch('qmi_dial.time.sleep')
     @patch('qmi_dial.qmi', side_effect=ConnectionError)
