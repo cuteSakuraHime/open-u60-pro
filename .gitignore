@@ -51,3 +51,5 @@ tools/u60.env
 tools/.work/
 *.wav
 *.so
+
+/dist/
