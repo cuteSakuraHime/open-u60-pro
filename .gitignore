@@ -45,3 +45,9 @@ zte-agent/docs/apns-deployment-*.md
 *.dtb
 __pycache__/
 
+# Local machine configuration and router tool output
+mobile/ios/OpenU60/.env
+tools/u60.env
+tools/.work/
+*.wav
+*.so

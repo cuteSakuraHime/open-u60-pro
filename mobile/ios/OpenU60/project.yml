@@ -1,7 +1,7 @@
 name: OpenU60
 
 options:
-  bundleIdPrefix: com.jesthersilvestre.openu60
+  bundleIdPrefix: ${BUNDLE_ID_PREFIX}
   deploymentTarget:
     iOS: "17.0"
   xcodeVersion: "26.6"
@@ -11,6 +11,7 @@ settings:
   base:
     # Language mode, independent of the Swift compiler bundled with Xcode.
     SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
 
 targets:
   OpenU60:
@@ -31,7 +32,7 @@ targets:
         aps-environment: development
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.jesthersilvestre.openu60
+        PRODUCT_BUNDLE_IDENTIFIER: ${BUNDLE_ID_PREFIX}
         INFOPLIST_FILE: Resources/Info.plist
         GENERATE_INFOPLIST_FILE: false
         CODE_SIGN_STYLE: Automatic
@@ -46,7 +47,7 @@ targets:
       - path: Shared
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.jesthersilvestre.openu60.liveactivity
+        PRODUCT_BUNDLE_IDENTIFIER: ${BUNDLE_ID_PREFIX}.liveactivity
         CODE_SIGN_STYLE: Automatic
         GENERATE_INFOPLIST_FILE: true
         INFOPLIST_KEY_CFBundleDisplayName: OpenU60 Signal

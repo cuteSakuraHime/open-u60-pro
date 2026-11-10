@@ -34,8 +34,11 @@ fi
 # --- Constants ---------------------------------------------------------------
 SCHEME="OpenU60"
 XCODEPROJ="OpenU60.xcodeproj"
-BUNDLE_ID="com.jesthersilvestre.openu60"
-TEAM_ID="${TEAM_ID:-}"
+TEAM_ID="${TEAM_ID:-${DEVELOPMENT_TEAM:-}}"
+# project.yml reads both through XcodeGen; an unset value would become empty.
+export BUNDLE_ID_PREFIX="${BUNDLE_ID_PREFIX:-dev.local.openu60}"
+export DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-$TEAM_ID}"
+BUNDLE_ID="$BUNDLE_ID_PREFIX"
 
 # --- Colors ------------------------------------------------------------------
 RED='\033[0;31m'
