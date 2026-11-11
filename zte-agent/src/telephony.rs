@@ -320,12 +320,13 @@ fn voice_call_snapshot(resp: &str) -> Result<Vec<Value>, &'static str> {
         .collect())
 }
 
-/// Read CLCC with one bounded retry. B29 occasionally returns only the
-/// command echo on the first transaction; CLCC is read-only, so retrying it is
-/// safe. Call-control commands themselves are never retried.
+/// Read CLCC with two bounded retries. B29 occasionally returns only the
+/// command echo, then delivers that transaction's final result to the next
+/// reader. A third read lets the late packet drain without treating it as the
+/// new transaction. CLCC is read-only; call-control commands are never retried.
 fn read_voice_calls(state: &AppState) -> Result<Vec<Value>, String> {
     let mut last = "incomplete call status response".to_string();
-    for attempt in 0..2 {
+    for attempt in 0..3 {
         match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
             Ok(resp) => match voice_call_snapshot(&resp) {
                 Ok(calls) => return Ok(calls),
@@ -333,8 +334,8 @@ fn read_voice_calls(state: &AppState) -> Result<Vec<Value>, String> {
             },
             Err(error) => last = error,
         }
-        if attempt == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
     Err(last)
