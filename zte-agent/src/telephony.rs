@@ -277,9 +277,7 @@ pub fn call_answer(state: &AppState) -> (u16, Value) {
     };
     let code = final_line(&reply);
     let answered = code == Some("OK")
-        || matches!(at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2)
-            .map(|resp| voice_call_snapshot(&resp)),
-            Ok(Ok(calls)) if calls.iter().any(|c| c["stat"] == "active"));
+        || matches!(read_voice_calls(state), Ok(calls) if calls.iter().any(|c| c["stat"] == "active"));
     if answered {
         // An answered call is active even if the app never polls call_status;
         // the modem policies must not touch the radio while it lasts.
@@ -293,7 +291,13 @@ pub fn call_answer(state: &AppState) -> (u16, Value) {
 /// Return only voice/unknown bearers, and never turn a partial or malformed
 /// CLCC transaction into a confirmed idle state.
 fn voice_call_snapshot(resp: &str) -> Result<Vec<Value>, &'static str> {
-    if resp.lines().filter(|line| !line.trim().is_empty()).last().map(str::trim) != Some("OK") {
+    let lines = resp.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    // B29 can deliver a previous transaction's final OK after its reader has
+    // timed out. Require this transaction's command echo as well as its final
+    // result so a late, isolated OK can never be reported as confirmed idle.
+    if !lines.iter().any(|line| line.eq_ignore_ascii_case("AT+CLCC"))
+        || lines.last().copied() != Some("OK")
+    {
         return Err("incomplete call status response");
     }
     for line in resp.lines().map(str::trim) {
@@ -316,14 +320,30 @@ fn voice_call_snapshot(resp: &str) -> Result<Vec<Value>, &'static str> {
         .collect())
 }
 
+/// Read CLCC with one bounded retry. B29 occasionally returns only the
+/// command echo on the first transaction; CLCC is read-only, so retrying it is
+/// safe. Call-control commands themselves are never retried.
+fn read_voice_calls(state: &AppState) -> Result<Vec<Value>, String> {
+    let mut last = "incomplete call status response".to_string();
+    for attempt in 0..2 {
+        match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
+            Ok(resp) => match voice_call_snapshot(&resp) {
+                Ok(calls) => return Ok(calls),
+                Err(error) => last = error.to_string(),
+            },
+            Err(error) => last = error,
+        }
+        if attempt == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Err(last)
+}
+
 /// GET /api/call/status
 pub fn call_status(state: &AppState) -> (u16, Value) {
-    match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
-        Ok(resp) => {
-            let calls = match voice_call_snapshot(&resp) {
-                Ok(calls) => calls,
-                Err(error) => return (503, json!({"ok": false, "error": error})),
-            };
+    match read_voice_calls(state) {
+        Ok(calls) => {
             state.call_active.store(!calls.is_empty(), Ordering::Relaxed);
             // A complete status with no voice call means the call ended remotely.
             if calls.is_empty() {
@@ -374,11 +394,8 @@ pub fn call_audio_start(state: &AppState, body: &[u8]) -> (u16, Value) {
         return (400, json!({"ok": false, "error": "host must be an IPv4 address"}));
     };
     let restart = parsed["restart"].as_bool().unwrap_or(false);
-    let active = match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
-        Ok(resp) => match voice_call_snapshot(&resp) {
-            Ok(calls) => calls.iter().any(|c| c["stat"] == "active"),
-            Err(e) => return (503, json!({"ok": false, "error": e})),
-        },
+    let active = match read_voice_calls(state) {
+        Ok(calls) => calls.iter().any(|c| c["stat"] == "active"),
         Err(e) => return (503, json!({"ok": false, "error": e})),
     };
     if !active {
@@ -532,7 +549,10 @@ mod call_snapshot_tests {
     #[test]
     fn only_complete_valid_responses_confirm_idle() {
         assert!(voice_call_snapshot("AT+CLCC\r\nOK\r\n").unwrap().is_empty());
-        assert!(voice_call_snapshot("+CLCC: 1,0,0,1,0,\"\",128\r\nOK\r\n").unwrap().is_empty());
+        assert!(voice_call_snapshot("AT+CLCC\r\n+CLCC: 1,0,0,1,0,\"\",128\r\nOK\r\n").unwrap().is_empty());
+        // A late final result from a previous timed-out transaction is not a
+        // complete status response without this transaction's command echo.
+        assert!(voice_call_snapshot("OK\r\n").is_err());
         for raw in ["", "AT+CLCC\r\n", "ERROR\r\n", "+CLCC: 1,0\r\nOK\r\n",
                     "+CLCC: 1,0,bad,0,0\r\nOK\r\n", "OK\r\nERROR\r\n"] {
             assert!(voice_call_snapshot(raw).is_err(), "accepted {raw:?}");
