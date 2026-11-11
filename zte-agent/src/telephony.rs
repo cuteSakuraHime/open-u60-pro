@@ -228,20 +228,35 @@ pub fn call_dial(state: &AppState, body: &[u8]) -> (u16, Value) {
     };
     // Sanitize: keep digits, +, *, #
     let clean: String = number.chars().filter(|c| c.is_ascii_digit() || "+*#".contains(*c)).collect();
-    match at_cmd::send(&state.at_port, &format!("ATD{clean};"), 5) {
-        Ok(resp) if resp.contains("ERROR") => (500, json!({"ok": false, "error": "dial failed"})),
-        Ok(_) => {
-            state.call_active.store(true, Ordering::Relaxed);
-            (200, json!({"ok": true, "data": {"status": "ok"}}))
-        }
+    match at_cmd::send_until_final(&state.at_port, &format!("ATD{clean};"), 5) {
+        Ok(resp) => match final_line(&resp) {
+            Some(code) if code != "OK" => {
+                (500, json!({"ok": false, "error": format!("dial failed: {code}")}))
+            }
+            _ => {
+                state.call_active.store(true, Ordering::Relaxed);
+                (200, json!({"ok": true, "data": {"status": "ok"}}))
+            }
+        },
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
 
+/// The final result code in a modem reply, if any.
+fn final_line(reply: &str) -> Option<&str> {
+    reply.lines().map(str::trim).find(|line| {
+        matches!(*line, "OK" | "ERROR" | "NO CARRIER" | "BUSY" | "NO ANSWER" | "NO DIALTONE")
+            || line.starts_with("+CME ERROR")
+            || line.starts_with("+CMS ERROR")
+    })
+}
+
 /// POST /api/call/hangup
 pub fn call_hangup(state: &AppState) -> (u16, Value) {
+    let result = at_cmd::send_until_final(&state.at_port, "AT+CHUP", 3);
+    // After the hang-up, so ending the call never waits for the bridge to exit.
     state.voice_bridge.stop();
-    match at_cmd::send(&state.at_port, "AT+CHUP", 3) {
+    match result {
         Ok(_) => {
             state.call_active.store(false, Ordering::Relaxed);
             (200, json!({"ok": true, "data": {"status": "ok"}}))
@@ -251,16 +266,28 @@ pub fn call_hangup(state: &AppState) -> (u16, Value) {
 }
 
 /// POST /api/call/answer
+///
+/// Succeeds on `OK`, or when the modem lists the call as active anyway (some
+/// firmware confirms only after the reply window). Otherwise reports the modem's
+/// reply, so the app can show why instead of a request timeout.
 pub fn call_answer(state: &AppState) -> (u16, Value) {
-    match at_cmd::send(&state.at_port, "ATA", 3) {
-        Ok(_) => {
-            // An answered call is active even if the app never polls call_status;
-            // the modem policies must not touch the radio while it lasts.
-            state.call_active.store(true, Ordering::Relaxed);
-            (200, json!({"ok": true, "data": {"status": "ok"}}))
-        }
-        Err(e) => (503, json!({"ok": false, "error": e})),
+    let reply = match at_cmd::send_until_final(&state.at_port, "ATA", 5) {
+        Ok(reply) => reply,
+        Err(e) => return (503, json!({"ok": false, "error": e})),
+    };
+    let code = final_line(&reply);
+    let answered = code == Some("OK")
+        || matches!(at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2)
+            .map(|resp| voice_call_snapshot(&resp)),
+            Ok(Ok(calls)) if calls.iter().any(|c| c["stat"] == "active"));
+    if answered {
+        // An answered call is active even if the app never polls call_status;
+        // the modem policies must not touch the radio while it lasts.
+        state.call_active.store(true, Ordering::Relaxed);
+        return (200, json!({"ok": true, "data": {"status": "ok"}}));
     }
+    let why = code.unwrap_or("no reply from the modem");
+    (502, json!({"ok": false, "error": format!("answer failed: {why}")}))
 }
 
 /// Return only voice/unknown bearers, and never turn a partial or malformed
@@ -291,7 +318,7 @@ fn voice_call_snapshot(resp: &str) -> Result<Vec<Value>, &'static str> {
 
 /// GET /api/call/status
 pub fn call_status(state: &AppState) -> (u16, Value) {
-    match at_cmd::send(&state.at_port, "AT+CLCC", 2) {
+    match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
         Ok(resp) => {
             let calls = match voice_call_snapshot(&resp) {
                 Ok(calls) => calls,
@@ -328,15 +355,16 @@ pub fn call_dtmf(state: &AppState, body: &[u8]) -> (u16, Value) {
         return (400, json!({"ok": false, "error": "no valid digits"}));
     }
     let at_cmd_str = format!("AT{}", cmds.join(";"));
-    match at_cmd::send(&state.at_port, &at_cmd_str, 2) {
+    match at_cmd::send_until_final(&state.at_port, &at_cmd_str, 2) {
         Ok(_) => (200, json!({"ok": true, "data": {"status": "ok"}})),
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
 
-/// POST /api/call/audio/start — body: {"host": "<phone LAN IPv4>"}
+/// POST /api/call/audio/start — body: {"host": "<phone LAN IPv4>", "restart": false}
 /// Streams the active call to that phone (PCMU RTP, UDP 48894). Requires an
-/// active voice call so the bridge never holds the audio path while idle.
+/// active voice call so the bridge never holds the audio path while idle. A
+/// bridge already streaming to `host` keeps running unless `restart` is true.
 pub fn call_audio_start(state: &AppState, body: &[u8]) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -345,7 +373,8 @@ pub fn call_audio_start(state: &AppState, body: &[u8]) -> (u16, Value) {
     let Some(host) = parsed["host"].as_str().and_then(|h| h.parse::<std::net::Ipv4Addr>().ok()) else {
         return (400, json!({"ok": false, "error": "host must be an IPv4 address"}));
     };
-    let active = match at_cmd::send(&state.at_port, "AT+CLCC", 2) {
+    let restart = parsed["restart"].as_bool().unwrap_or(false);
+    let active = match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
         Ok(resp) => match voice_call_snapshot(&resp) {
             Ok(calls) => calls.iter().any(|c| c["stat"] == "active"),
             Err(e) => return (503, json!({"ok": false, "error": e})),
@@ -355,7 +384,7 @@ pub fn call_audio_start(state: &AppState, body: &[u8]) -> (u16, Value) {
     if !active {
         return (409, json!({"ok": false, "error": "no active voice call"}));
     }
-    match state.voice_bridge.start(host) {
+    match state.voice_bridge.start(host, restart) {
         Ok(()) => (200, json!({"ok": true, "data": state.voice_bridge.status()})),
         Err(e) => (500, json!({"ok": false, "error": e})),
     }
@@ -375,7 +404,7 @@ pub fn call_mute(state: &AppState, body: &[u8]) -> (u16, Value) {
     };
     let enabled = parsed["enabled"].as_bool().unwrap_or(false);
     let val = if enabled { "1" } else { "0" };
-    match at_cmd::send(&state.at_port, &format!("AT+CMUT={val}"), 2) {
+    match at_cmd::send_until_final(&state.at_port, &format!("AT+CMUT={val}"), 2) {
         Ok(_) => (200, json!({"ok": true, "data": {"muted": enabled}})),
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
@@ -476,7 +505,16 @@ pub fn stk_menu(state: &AppState) -> (u16, Value) {
 
 #[cfg(test)]
 mod call_snapshot_tests {
-    use super::voice_call_snapshot;
+    use super::{final_line, voice_call_snapshot};
+
+    #[test]
+    fn final_line_finds_the_result_code() {
+        assert_eq!(final_line("ATA\r\r\nOK\r\n"), Some("OK"));
+        assert_eq!(final_line("\r\nNO CARRIER\r\n"), Some("NO CARRIER"));
+        assert_eq!(final_line("\r\n+CME ERROR: 30\r\n"), Some("+CME ERROR: 30"));
+        assert_eq!(final_line("\r\nRING\r\n"), None);
+        assert_eq!(final_line(""), None);
+    }
 
     #[test]
     fn data_bearers_do_not_mask_a_voice_call() {

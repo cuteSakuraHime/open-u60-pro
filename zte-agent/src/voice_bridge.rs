@@ -9,7 +9,8 @@
 
 use std::net::Ipv4Addr;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -23,7 +24,56 @@ const MAX_SECONDS: u32 = 4 * 3600;
 
 #[derive(Default)]
 pub struct VoiceBridge {
-    child: Mutex<Option<(Child, Ipv4Addr)>>,
+    inner: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    child: Option<(Child, Ipv4Addr)>,
+    /// How the last bridge ended on its own (not stopped by us), for `status`.
+    last_exit: Option<String>,
+}
+
+impl Inner {
+    /// Forget a bridge that has exited, keeping how it ended.
+    fn reap(&mut self) {
+        if let Some((child, _)) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    self.last_exit = Some(status.to_string());
+                    self.child = None;
+                }
+                Err(e) => {
+                    self.last_exit = Some(e.to_string());
+                    self.child = None;
+                }
+            }
+        }
+    }
+}
+
+/// Stop the vendor tool: SIGINT (its own stop path, if it has one), then SIGTERM,
+/// then SIGKILL. The grace periods give it a chance to close the modem's voice
+/// session, which the next bridge must open again.
+fn terminate(mut child: Child) {
+    let pid = child.id() as libc::pid_t;
+    for (signal, grace) in [(libc::SIGINT, 600u64), (libc::SIGTERM, 400)] {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        // The child is not reaped yet, so `pid` cannot have been reused.
+        unsafe { libc::kill(pid, signal) };
+        let deadline = Instant::now() + Duration::from_millis(grace);
+        while Instant::now() < deadline {
+            if !matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Replace one NUL-terminated default address in place, keeping the length.
@@ -75,18 +125,31 @@ fn router_lan_ip() -> Result<Ipv4Addr, String> {
 }
 
 impl VoiceBridge {
-    pub fn start(&self, peer: Ipv4Addr) -> Result<(), String> {
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stream the active call to `peer`. A bridge already streaming to `peer` is
+    /// left alone unless `restart`: a second start (the app's status poll and its
+    /// audio activation can both ask) used to kill and respawn it mid-call.
+    pub fn start(&self, peer: Ipv4Addr, restart: bool) -> Result<(), String> {
         let router = router_lan_ip()?;
         validate_peer(peer, router)?;
         let original = std::fs::read(VENDOR_LIB).map_err(|e| format!("read vendor lib: {e}"))?;
         let patched = patch_library(&original, router, peer)?;
-        std::fs::create_dir_all(WORK_DIR).map_err(|e| e.to_string())?;
-        std::fs::write(format!("{WORK_DIR}/libztertp.so"), patched).map_err(|e| e.to_string())?;
-        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((mut old, _)) = guard.take() {
-            let _ = old.kill();
-            let _ = old.wait();
+        let mut inner = self.lock();
+        inner.reap();
+        if !restart && inner.child.as_ref().is_some_and(|(_, running)| *running == peer) {
+            return Ok(());
         }
+        if let Some((old, _)) = inner.child.take() {
+            terminate(old);
+        }
+        std::fs::create_dir_all(WORK_DIR).map_err(|e| e.to_string())?;
+        // A new file renamed into place: a tool still mapping the old copy is untouched.
+        let staged = format!("{WORK_DIR}/libztertp.so.new");
+        std::fs::write(&staged, patched).map_err(|e| e.to_string())?;
+        std::fs::rename(&staged, format!("{WORK_DIR}/libztertp.so")).map_err(|e| e.to_string())?;
         let child = Command::new(VENDOR_TOOL)
             .env("LD_LIBRARY_PATH", WORK_DIR)
             .args(["-i", "11C05000", "-d", "2,2147483664", "-p", "dummy", "-r", "dummy", "-t", "0",
@@ -94,29 +157,27 @@ impl VoiceBridge {
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("start bridge: {e}"))?;
-        *guard = Some((child, peer));
+        inner.child = Some((child, peer));
+        inner.last_exit = None;
         Ok(())
     }
 
-    /// Idempotent; safe to call when nothing runs.
+    /// Idempotent; safe to call when nothing runs. Returns at once: the tool is
+    /// signalled and reaped on its own thread, so a hang-up never waits for it.
     pub fn stop(&self) {
-        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((mut child, _)) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let taken = self.lock().child.take();
+        if let Some((child, _)) = taken {
+            std::thread::spawn(move || terminate(child));
         }
     }
 
     pub fn status(&self) -> Value {
-        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((child, _)) = guard.as_mut() {
-            if !matches!(child.try_wait(), Ok(None)) {
-                *guard = None;
-            }
-        }
-        match guard.as_ref() {
-            Some((_, peer)) => json!({"running": true, "host": peer.to_string(), "port": 48894}),
-            None => json!({"running": false}),
+        let mut inner = self.lock();
+        inner.reap();
+        match (&inner.child, &inner.last_exit) {
+            (Some((_, peer)), _) => json!({"running": true, "host": peer.to_string(), "port": 48894}),
+            (None, Some(exit)) => json!({"running": false, "exited": exit}),
+            (None, None) => json!({"running": false}),
         }
     }
 }
@@ -159,6 +220,38 @@ mod tests {
         let mut twice = fake_lib();
         twice.extend_from_slice(b"\0192.168.253.1\0");
         assert!(patch_library(&twice, Ipv4Addr::new(192, 168, 0, 1), Ipv4Addr::new(192, 168, 0, 9)).is_err());
+    }
+
+    #[test]
+    fn terminate_stops_a_tool_that_honours_sigint_at_once() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let started = Instant::now();
+        terminate(child);
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn terminate_escalates_to_sigkill() {
+        // Ignores SIGINT and SIGTERM; only SIGKILL ends it.
+        let child = Command::new("sh").args(["-c", "trap '' INT TERM; while :; do sleep 0.2; done"])
+            .spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(100)); // let the traps install
+        let started = Instant::now();
+        terminate(child);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(1000) && took < Duration::from_millis(2500), "{took:?}");
+    }
+
+    #[test]
+    fn exited_bridge_reports_how_it_ended() {
+        let bridge = VoiceBridge::default();
+        let child = Command::new("sh").args(["-c", "exit 3"]).spawn().unwrap();
+        bridge.lock().child = Some((child, Ipv4Addr::new(192, 168, 0, 9)));
+        std::thread::sleep(Duration::from_millis(200));
+        let status = bridge.status();
+        assert_eq!(status["running"], false);
+        assert!(status["exited"].as_str().unwrap().contains('3'), "{status}");
+        bridge.stop(); // nothing left to stop
     }
 
     #[test]

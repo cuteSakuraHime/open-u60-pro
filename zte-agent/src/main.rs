@@ -223,7 +223,7 @@ fn busy_check(state: &Arc<AppState>) -> Box<dyn Fn() -> Option<&'static str> + S
             // the app stopped polling call_status. Fail closed: only a
             // complete "no calls" reply clears the flag; an empty, partial
             // or ERROR reply keeps deferring (the policies retry in 60 s).
-            match at_cmd::send(&state.at_port, "AT+CLCC", 2) {
+            match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
                 Ok(resp) if clcc_confirms_idle(&resp) => {
                     state.call_active.store(false, Ordering::Relaxed)
                 }
