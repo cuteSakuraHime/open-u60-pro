@@ -5,6 +5,7 @@ name: iOS IPA
 on:
   workflow_dispatch: {}
   push:
+    branches: ['dev-u60-duo']
     tags: ['ios-*']
 
 permissions:
