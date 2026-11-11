@@ -8,6 +8,7 @@ mod build_info;
 mod cache;
 mod cell;
 mod charge_policy;
+mod clash;
 mod conn_watchdog;
 mod client_details;
 mod console;
@@ -136,6 +137,7 @@ fn main() {
     let oos_service_rx = event_bus.subscribe("zwrt_servicestatus");
     let connwd_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     let ttl_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let clash_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     let wireguard_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     let dns_network_rx = dns_control::subscribe_network_changes(&event_bus);
     let identity_events = sim_identity::FIRMWARE_EVENTS
@@ -156,6 +158,8 @@ fn main() {
         eprintln!("[dns] startup synchronization failed: {error}");
     }
     state.doh.auto_start();
+    state.clash.auto_start();
+    state.clash.start_wan_watch(clash_wan_rx);
     dns_control::start_network_watch(Arc::clone(&state), dns_network_rx);
     state.scheduler.start(Arc::clone(&state));
     state
