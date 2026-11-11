@@ -28,6 +28,14 @@ final class CallViewModel {
     private let pollLoop = PollingLoop()
     private let durationLoop = PollingLoop()
     private var connectionGeneration = 0
+    private var inForeground = true
+    private var pollingFast = false
+    /// At most one `/api/call/audio/start` in flight.
+    private var routerAudioTask: Task<Void, Never>?
+    /// Downlink packets seen at the last poll, and when that count last moved.
+    private var audioWatch = (received: 0, changedAt: Date())
+    private var lastAudioRestart = Date.distantPast
+    private static let noAudioMessage = "未收到路由器的通话声音，正在重新连接…"
 
     /// Forget local state when authentication or the router changes; never sends hangup.
     func resetConnection() {
@@ -35,6 +43,8 @@ final class CallViewModel {
         // The router call may continue; only the local system UI is closed.
         callKit.reportEnded()
         voice.stop()
+        routerAudioTask?.cancel()
+        routerAudioTask = nil
         history.abandon()
         stopPolling()
         stopDurationTimer()
@@ -78,29 +88,58 @@ final class CallViewModel {
         }
         do {
             try voice.start(router: host, recordTo: url)
-            // Outgoing calls activate audio before they connect; the poll starts
+            audioWatch = (0, Date())
+            // Outgoing calls activate audio before they connect; then the poll starts
             // the router bridge once the call is active.
-            if callState == .active { Task { await startRouterAudio() } }
+            requestRouterAudio()
         } catch {
             voice.stop()
             logger.error("Voice stream failed: \(error.localizedDescription, privacy: .public)")
-            self.error = "通话音频启动失败"
+            self.error = "通话音频启动失败：\(error.localizedDescription)"
         }
     }
 
-    /// Ask the router to stream the active call to this phone. Retried by the
-    /// status poll until the router reports its bridge running.
-    private func startRouterAudio() async {
-        guard let router = URL(string: client.baseURL)?.host,
-              let phone = VoiceStream.wifiAddress(sameSubnetAs: router) else {
+    /// Ask the router to stream the active call to this phone. One request at a time;
+    /// the status poll repeats it until the router reports its bridge running.
+    private func requestRouterAudio(restart: Bool = false) {
+        guard routerAudioTask == nil, voice.isRunning, callState == .active,
+              let router = URL(string: client.baseURL)?.host else { return }
+        guard let phone = VoiceStream.wifiAddress(sameSubnetAs: router) else {
             error = "未连接到路由器 Wi-Fi，无法传输通话声音"
             return
         }
-        do {
-            _ = try await client.postJSON("/api/call/audio/start", body: ["host": phone])
-        } catch {
-            logger.error("Router audio start failed: \(error.localizedDescription, privacy: .public)")
+        let generation = connectionGeneration
+        var body: [String: Any] = ["host": phone]
+        if restart { body["restart"] = true }
+        routerAudioTask = Task {
+            defer { if generation == connectionGeneration { routerAudioTask = nil } }
+            do {
+                _ = try await client.postJSON("/api/call/audio/start", body: body)
+            } catch {
+                guard generation == connectionGeneration, !error.isCancellation else { return }
+                logger.error("Router audio start failed: \(error.localizedDescription, privacy: .public)")
+                self.error = "通话声音启动失败：\(error.localizedDescription)"
+            }
         }
+    }
+
+    /// The router reports its bridge running: make sure audio actually arrives. A bridge
+    /// that runs without sending (the voice path was busy when it started) is restarted,
+    /// at most every 15 s.
+    private func checkAudioFlow() {
+        guard voice.isRunning else { return }
+        let received = voice.stats.received
+        if received != audioWatch.received {
+            audioWatch = (received, Date())
+            if error == Self.noAudioMessage { error = nil }
+            return
+        }
+        guard Date().timeIntervalSince(audioWatch.changedAt) > 4,
+              Date().timeIntervalSince(lastAudioRestart) > 15 else { return }
+        lastAudioRestart = Date()
+        audioWatch.changedAt = Date()
+        error = Self.noAudioMessage
+        requestRouterAudio(restart: true)
     }
 
     // MARK: - Number Input
@@ -231,8 +270,11 @@ final class CallViewModel {
 
     // MARK: - Polling
 
+    /// Every second while a call is in progress (so a connected call gets its audio
+    /// quickly), every two seconds while idle.
     func startPolling() {
-        pollLoop.start(interval: .seconds(2)) { [weak self] in
+        pollingFast = callState != .idle
+        pollLoop.start(interval: pollingFast ? .seconds(1) : .seconds(2)) { [weak self] in
             guard let self else { return .failure }
             return await self.pollCallStatus()
         }
@@ -242,6 +284,29 @@ final class CallViewModel {
     /// Suspending polling never hangs up a router call.
     func stopPolling() {
         pollLoop.stop()
+    }
+
+    /// Called as the scene becomes active or leaves it. Idle polling is for the foreground
+    /// only. A call in progress keeps polling in the background (the system call screen,
+    /// a locked phone): its audio session keeps the app running, and only the poll requests
+    /// the router's audio bridge and notices a remote hang-up.
+    func setForeground(_ foreground: Bool) {
+        inForeground = foreground
+        if foreground {
+            startPolling()
+        } else if callState == .idle && callKit.currentCall == nil {
+            stopPolling()
+        }
+    }
+
+    private func adjustPolling() {
+        let inCall = callState != .idle
+        guard pollLoop.isRunning else { return }
+        if !inCall && !inForeground && callKit.currentCall == nil {
+            stopPolling()
+        } else if inCall != pollingFast {
+            startPolling()
+        }
     }
 
     /// One-shot reconciliation when the screen appears.
@@ -255,6 +320,12 @@ final class CallViewModel {
     }
 
     private func pollCallStatus() async -> PollingLoop.Outcome {
+        let outcome = await readCallStatus()
+        adjustPolling()
+        return outcome
+    }
+
+    private func readCallStatus() async -> PollingLoop.Outcome {
         let generation = connectionGeneration
         let result: [String: Any]
         do {
@@ -306,8 +377,10 @@ final class CallViewModel {
             callKit.reportConnected()
             history.markConnected()
             let audio = result["audio"] as? [String: Any]
-            if voice.isRunning, (audio?["running"] as? Bool) != true {
-                await startRouterAudio()
+            if (audio?["running"] as? Bool) == true {
+                checkAudioFlow()
+            } else {
+                requestRouterAudio()
             }
         case "incoming", "waiting":
             let caller = number.isEmpty ? (dir == "mt" ? "Unknown" : number) : number

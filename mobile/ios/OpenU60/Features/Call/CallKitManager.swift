@@ -30,8 +30,10 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         configuration.includesCallsInRecents = true
         provider = CXProvider(configuration: configuration)
         // Voice chat mode enables the system echo canceller for the VoIP path.
-        try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat,
-                                                          options: [.allowBluetooth])
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+        // 10 ms I/O keeps playout and mic latency low; CallKit applies it on activation.
+        try? session.setPreferredIOBufferDuration(0.01)
         super.init()
         provider.setDelegate(self, queue: nil)
     }

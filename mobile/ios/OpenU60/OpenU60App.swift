@@ -80,11 +80,12 @@ struct OpenU60App: App {
                 }
                 .task(id: authManager.isAuthenticated && scenePhase == .active) {
                     if authManager.isAuthenticated && scenePhase == .active {
-                        callModel.startPolling()
+                        callModel.setForeground(true)
                     } else if !authManager.isAuthenticated {
                         callModel.resetConnection()
                     } else {
-                        callModel.stopPolling()
+                        // Keeps polling while a call is in progress.
+                        callModel.setForeground(false)
                     }
                 }
                 .task(id: authManager.isAuthenticated) {

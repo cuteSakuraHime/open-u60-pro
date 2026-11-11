@@ -48,4 +48,37 @@ let a = level(over.pop()), b = level(over.pop())
 expect(abs(a - 350) < 20 && abs(b - 450) < 20, "drops 0...2 on overflow, got \(a) \(b)")
 over.push(frame(500, 999, ssrc: 99))
 expect(over.pop() == nil && over.lost == 0, "new stream prebuffers again")
+
+// Adaptation: each 20 ms spent waiting after an underrun raises the target, so playback
+// resumes with enough buffered to ride out the same stall next time.
+var adapt = JitterBuffer(targetDepth: 3)
+for s in UInt16(0)..<3 { adapt.push(frame(s, 100)) }
+for _ in 0..<3 { expect(adapt.pop() != nil, "prebuffered frames play") }
+expect(adapt.pop() == nil && adapt.underruns == 1, "stall underruns")
+expect(adapt.pop() == nil && adapt.pop() == nil, "still waiting")
+expect(adapt.targetDepth == 5, "two waiting pops raise the target to 5, got \(adapt.targetDepth)")
+for s in UInt16(3)..<8 { adapt.push(frame(s, 300)) }
+expect(level(adapt.pop()) > 250 && adapt.targetDepth == 5, "resumes at the deeper target")
+// A steady stream gives a frame back every 10 s.
+var seq: UInt16 = 8
+for _ in 0..<JitterBuffer.steadyPopsToShrink {
+    adapt.push(frame(seq, 300)); seq &+= 1
+    expect(adapt.pop() != nil, "steady stream plays")
+}
+expect(adapt.targetDepth == 4 && adapt.lost == 0, "10 s steady shrinks the target, got \(adapt.targetDepth)")
+// The target never exceeds maxTarget, however long the wait.
+var stalled = JitterBuffer(targetDepth: 3)
+stalled.push(frame(0, 100)); stalled.push(frame(1, 100)); stalled.push(frame(2, 100))
+for _ in 0..<60 { _ = stalled.pop() }
+expect(stalled.targetDepth == stalled.maxTarget && stalled.maxTarget == 10, "capped at 200 ms")
+
+// A queue held well above target (a burst after a stall) is trimmed back, one frame per 0.5 s.
+var deep = JitterBuffer(targetDepth: 3)
+var s2: UInt16 = 0
+for _ in 0..<8 { deep.push(frame(s2, 100)); s2 &+= 1 }
+for _ in 0..<JitterBuffer.excessPopsToTrim {
+    deep.push(frame(s2, 100)); s2 &+= 1
+    _ = deep.pop()
+}
+expect(deep.trimmed == 1 && deep.lost == 0, "one frame trimmed, got \(deep.trimmed)")
 print("JITTER ALL PASS")

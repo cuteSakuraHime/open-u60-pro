@@ -1,128 +1,192 @@
 import AVFoundation
 import Darwin
-import Network
+import os
+
+private let logger = Logger(subsystem: "com.zte.companion", category: "Voice")
 
 /// Two-way call audio with the router's vendor RTP bridge (PCMU over UDP 48894).
-/// Mic → 8 kHz → μ-law RTP → router; router RTP → jitter buffer → speaker.
-/// Voice processing on the input node provides echo cancellation.
-/// Start only after CallKit activates the audio session.
+///
+/// - Downlink: router RTP → adaptive jitter buffer → source node → speaker. The output
+///   hardware pulls samples, so playback is paced by the audio clock.
+/// - Uplink: mic → 8 kHz → μ-law RTP → router, one packet per 20 ms. The input tap delivers
+///   about 100 ms at a time; pacing turns those bursts into a steady stream.
+///
+/// One UDP socket on 48894 carries both directions, pinned to the Wi-Fi interface. Voice
+/// processing on the input node provides echo cancellation. Start only after CallKit
+/// activates the audio session.
 final class VoiceStream {
+    enum Failure: LocalizedError {
+        case noWiFi
+        case noMicrophone
+
+        var errorDescription: String? {
+            switch self {
+            case .noWiFi: return "未连接到路由器 Wi-Fi"
+            case .noMicrophone: return "麦克风不可用"
+            }
+        }
+    }
+
     static let port: UInt16 = 48894
-    private let queue = DispatchQueue(label: "voice.stream")
+    /// Uplink packets allowed to wait for their slot (200 ms); older ones are dropped.
+    static let maxQueuedUplink = 10
+
+    private let queue = DispatchQueue(label: "voice.stream", qos: .userInteractive)
     private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    private let playout = PlayoutBuffer()
+    private lazy var source = AVAudioSourceNode(format: PlayoutBuffer.format, renderBlock: playout.renderBlock)
     private let wireFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 8_000, channels: 1, interleaved: true)!
-    private var listener: NWListener?
-    private var sender: NWConnection?
-    private var converter: AVAudioConverter?
+    private var graphReady = false
+    private var configurationObserver: NSObjectProtocol?
+
+    // Owned by `queue`.
+    private var socket: RTPSocket?
     private var packetizer = RTPPacketizer()
-    private var jitter = JitterBuffer()
-    private var playbackTimer: DispatchSourceTimer?
+    private var uplink: [Data] = []
+    private var uplinkTimer: DispatchSourceTimer?
     private var recorder: CallRecorder?
+    // Owned by the input tap's thread (replaced only while the tap is removed).
+    private var converter: AVAudioConverter?
+
     private(set) var isRunning = false
     var isMuted = false
 
-    /// This phone's IPv4 on the Wi-Fi interface that shares a /24 with the router;
-    /// the router's bridge sends call audio here.
-    static func wifiAddress(sameSubnetAs router: String) -> String? {
+    /// Received/lost/late counts and the jitter target, for the call screen and diagnostics.
+    var stats: PlayoutBuffer.Stats { playout.stats }
+
+    /// This phone's Wi-Fi interface and IPv4 on the router's /24; the router's bridge
+    /// sends call audio to that address.
+    static func wifiInterface(sameSubnetAs router: String) -> (name: String, address: String)? {
         let prefix = router.split(separator: ".").prefix(3).joined(separator: ".") + "."
         var head: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&head) == 0, let first = head else { return nil }
         defer { freeifaddrs(head) }
         for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let name = String(cString: ptr.pointee.ifa_name)
             guard let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
-                  String(cString: ptr.pointee.ifa_name).hasPrefix("en") else { continue }
+                  name.hasPrefix("en") else { continue }
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
                               nil, 0, NI_NUMERICHOST) == 0 else { continue }
             let address = String(cString: host)
-            if address.hasPrefix(prefix), address != router { return address }
+            if address.hasPrefix(prefix), address != router { return (name, address) }
         }
         return nil
     }
 
+    static func wifiAddress(sameSubnetAs router: String) -> String? {
+        wifiInterface(sameSubnetAs: router)?.address
+    }
+
     func start(router: String, recordTo url: URL?) throws {
         guard !isRunning else { return }
-        recorder = try url.map(CallRecorder.init)
-        try startNetwork(router: router)
-        try startAudio()
+        guard let wifi = Self.wifiInterface(sameSubnetAs: router) else { throw Failure.noWiFi }
+        do {
+            let recorder = try url.map(CallRecorder.init)
+            playout.reset()
+            try startNetwork(router: router, interface: wifi.name, recorder: recorder)
+            try startAudio()
+        } catch {
+            stop()
+            throw error
+        }
         isRunning = true
     }
 
     /// Idempotent; also finalizes the recording.
     func stop() {
-        queue.sync {
-            playbackTimer?.cancel(); playbackTimer = nil
-            listener?.cancel(); listener = nil
-            sender?.cancel(); sender = nil
-            try? recorder?.close(); recorder = nil
-            jitter = JitterBuffer()
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
         }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+        queue.sync {
+            uplinkTimer?.cancel(); uplinkTimer = nil
+            socket?.close(); socket = nil
+            uplink = []
+            try? recorder?.close(); recorder = nil
+        }
+        playout.reset()
         isRunning = false
     }
 
-    private func startNetwork(router: String) throws {
-        let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
-        params.requiredInterfaceType = .wifi   // never leak call audio over cellular
-        let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.port)!)
-        listener.newConnectionHandler = { [weak self] connection in
-            // Only the router may feed audio; anything else is dropped unopened.
-            guard case let .hostPort(host, _) = connection.endpoint, "\(host)" == router else {
-                connection.cancel(); return
-            }
-            connection.start(queue: self?.queue ?? .main)
-            self?.receive(on: connection)
+    // MARK: - Network
+
+    private func startNetwork(router: String, interface: String, recorder: CallRecorder?) throws {
+        let playout = self.playout
+        let socket = try RTPSocket(router: router, routerPort: Self.port, localPort: Self.port,
+                                   interface: interface, queue: queue) { [weak self] data in
+            guard let packet = RTPPacket(data) else { return }
+            playout.push(packet)
+            self?.recorder?.appendRemote(packet)
         }
-        listener.start(queue: queue)
-        self.listener = listener
-
-        let sender = NWConnection(host: NWEndpoint.Host(router), port: NWEndpoint.Port(rawValue: Self.port)!, using: params)
-        sender.start(queue: queue)
-        self.sender = sender
-
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20), leeway: .milliseconds(2))
-        timer.setEventHandler { [weak self] in self?.playOneFrame() }
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.sendQueuedFrame() }
+        queue.sync {
+            self.recorder = recorder
+            self.packetizer = RTPPacketizer()
+            self.uplink = []
+            self.socket = socket
+            self.uplinkTimer = timer
+        }
         timer.resume()
-        playbackTimer = timer
     }
 
-    private func receive(on connection: NWConnection) {
-        connection.receiveMessage { [weak self] data, _, _, error in
-            guard let self, error == nil else { return }
-            if let data, let packet = RTPPacket(data) {
-                self.jitter.push(packet)
-                self.recorder?.appendRemote(packet)
-            }
-            self.receive(on: connection)
-        }
+    /// On `queue`, every 20 ms.
+    private func sendQueuedFrame() {
+        guard !uplink.isEmpty, let socket else { return }
+        socket.send(uplink.removeFirst())
     }
 
-    private func playOneFrame() {
-        guard let frame = jitter.pop(),
-              let buffer = AVAudioPCMBuffer(pcmFormat: wireFormat, frameCapacity: AVAudioFrameCount(frame.count)) else { return }
-        buffer.frameLength = buffer.frameCapacity
-        frame.withUnsafeBufferPointer { buffer.int16ChannelData![0].update(from: $0.baseAddress!, count: frame.count) }
-        player.scheduleBuffer(buffer)
-    }
+    // MARK: - Audio
 
     private func startAudio() throws {
         let input = engine.inputNode
-        try input.setVoiceProcessingEnabled(true)
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: wireFormat)
+        if !input.isVoiceProcessingEnabled {
+            try input.setVoiceProcessingEnabled(true)
+        }
+        if !graphReady {
+            engine.attach(source)
+            engine.connect(source, to: engine.mainMixerNode, format: PlayoutBuffer.format)
+            graphReady = true
+        }
+        try installMicTap()
+        engine.prepare()
+        try engine.start()
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in self?.restartAfterConfigurationChange() }
+    }
 
+    private func installMicTap() throws {
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
         let micFormat = input.outputFormat(forBus: 0)
-        converter = AVAudioConverter(from: micFormat, to: wireFormat)
+        guard micFormat.sampleRate > 0, micFormat.channelCount > 0,
+              let converter = AVAudioConverter(from: micFormat, to: wireFormat) else {
+            throw Failure.noMicrophone
+        }
+        self.converter = converter
         input.installTap(onBus: 0, bufferSize: 1024, format: micFormat) { [weak self] buffer, _ in
             self?.sendMic(buffer)
         }
-        engine.prepare()
-        try engine.start()
-        player.play()
+    }
+
+    /// A route change (Bluetooth, speaker, wired headset) stops the engine and may change
+    /// the hardware formats; without a restart the call would go silent both ways.
+    private func restartAfterConfigurationChange() {
+        guard isRunning else { return }
+        do {
+            engine.connect(engine.mainMixerNode, to: engine.outputNode, format: nil)
+            try installMicTap()
+            engine.prepare()
+            try engine.start()
+            logger.info("Voice engine restarted after an audio route change")
+        } catch {
+            logger.error("Voice engine restart failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private func sendMic(_ buffer: AVAudioPCMBuffer) {
@@ -142,11 +206,12 @@ final class VoiceStream {
         let count = Int(out.frameLength)
         var samples = Array(UnsafeBufferPointer(start: out.int16ChannelData![0], count: count))
         queue.async { [weak self] in
-            guard let self, let sender = self.sender else { return }
+            guard let self, self.socket != nil else { return }
             if self.isMuted { samples = [Int16](repeating: 0, count: count) }
             self.recorder?.appendLocal(samples)
-            for packet in self.packetizer.packets(for: samples) {
-                sender.send(content: packet, completion: .idempotent)
+            self.uplink += self.packetizer.packets(for: samples)
+            if self.uplink.count > Self.maxQueuedUplink {
+                self.uplink.removeFirst(self.uplink.count - Self.maxQueuedUplink)
             }
         }
     }

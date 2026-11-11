@@ -33,4 +33,15 @@ cp mobile/ios/Tests/VoiceJitterTests.swift "$test_dir/main.swift"
 swiftc -module-cache-path "$test_dir/cache" "$call/CallAudio.swift" "$call/VoiceJitter.swift" \
     "$test_dir/main.swift" -o "$test_dir/jitter"
 "$test_dir/jitter"
+
+# Playout (AVFoundation) and the RTP socket (Darwin sockets) need macOS.
+if [ "$(uname)" = Darwin ]; then
+    cp mobile/ios/Tests/PlayoutBufferTests.swift "$test_dir/main.swift"
+    swiftc -module-cache-path "$test_dir/cache" "$call/CallAudio.swift" "$call/VoiceJitter.swift" \
+        "$call/PlayoutBuffer.swift" "$test_dir/main.swift" -o "$test_dir/playout"
+    "$test_dir/playout"
+    cp mobile/ios/Tests/RTPSocketTests.swift "$test_dir/main.swift"
+    swiftc -module-cache-path "$test_dir/cache" "$call/RTPSocket.swift" "$test_dir/main.swift" -o "$test_dir/rtp-socket"
+    "$test_dir/rtp-socket"
+fi
 echo "All Duo tests passed"
