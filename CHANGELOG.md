@@ -4,6 +4,13 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ## [Unreleased]
 
+### Fixed
+
+- Make call-control AT commands return when the modem sends its final result instead of waiting for the full timeout, so dial, answer, hang-up and status polling no longer block one another.
+- Ignore firmware-reported data/fax `AT+CLCC` bearers when reporting voice-call status while retaining strict validation of complete modem responses. This fixes `503 incomplete call status response` on B29 when transient IMS entries are present.
+- Restart and monitor the vendor RTP bridge more reliably, preserving two-way call audio across rapid call-state changes.
+- Improve iOS RTP receive/playout buffering and CallKit audio activation for steadier two-way audio and faster call control.
+
 ## [2.4.0] - 2026-11-04
 
 ### Highlights
