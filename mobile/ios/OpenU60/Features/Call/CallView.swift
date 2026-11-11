@@ -162,9 +162,9 @@ struct CallView: View {
                     callControlButton(
                         icon: "speaker.wave.3.fill",
                         label: "Speaker",
-                        isActive: false
+                        isActive: viewModel.isSpeaker
                     ) {
-                        // Speaker toggle placeholder for Phase 2 audio bridge
+                        viewModel.toggleSpeaker()
                     }
                 }
             }

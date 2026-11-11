@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 import os
 
@@ -17,6 +18,7 @@ final class CallViewModel {
     var phoneNumber: String = ""
     var callState: CallState = .idle
     var isMuted: Bool = false
+    var isSpeaker: Bool = false
     var callDuration: TimeInterval = 0
     var error: String?
     var showKeypad: Bool = false
@@ -58,7 +60,10 @@ final class CallViewModel {
         callKit.onAnswer = { [weak self] in await self?.performAnswer() ?? false }
         callKit.onEnd = { [weak self] in await self?.performHangup() ?? false }
         callKit.onAudioActivated = { [weak self] in self?.startVoice() }
-        callKit.onAudioDeactivated = { [weak self] in self?.voice.stop() }
+        callKit.onAudioDeactivated = { [weak self] in
+            self?.voice.stop()
+            self?.isSpeaker = false
+        }
         callKit.onMute = { [weak self] muted in self?.voice.isMuted = muted }
     }
 
@@ -209,6 +214,18 @@ final class CallViewModel {
             }
         } catch {
             // keep current state
+        }
+    }
+
+    /// Route call audio between the receiver and the loudspeaker. CallKit owns the
+    /// `.playAndRecord` session, so only the output port is overridden here.
+    func toggleSpeaker() {
+        let enable = !isSpeaker
+        do {
+            try AVAudioSession.sharedInstance().overrideOutputAudioPort(enable ? .speaker : .none)
+            isSpeaker = enable
+        } catch {
+            logger.error("Speaker route failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
