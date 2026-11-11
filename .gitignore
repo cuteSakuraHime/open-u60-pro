@@ -52,4 +52,5 @@ tools/.work/
 *.wav
 *.so
 
-/dist/
+/dist/build.log
+__pycache__/
