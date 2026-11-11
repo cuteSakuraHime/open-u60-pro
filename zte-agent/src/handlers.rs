@@ -15,6 +15,8 @@ pub struct AppState {
     pub client_details: crate::client_details::ClientMonitor,
     pub dashboard: Arc<crate::dashboard::Dashboard>,
     pub live_activity: Arc<crate::live_activity::LiveActivity>,
+    /// Direct APNs wake-ups; message/caller data is fetched once over the LAN.
+    pub device_push: Arc<crate::device_push::DevicePush>,
     pub auth: Arc<AuthState>,
     pub cpu: CpuTracker,
     pub speed: SpeedTracker,
@@ -54,6 +56,7 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
+        let device_push = Arc::new(crate::device_push::DevicePush::new());
         let dashboard = Arc::new(crate::dashboard::Dashboard::default());
         let ota = crate::ota::OtaManager::system(Arc::downgrade(&dashboard));
         Self {
@@ -61,6 +64,7 @@ impl AppState {
             dashboard,
             tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),
             live_activity,
+            device_push,
             auth: Arc::new(AuthState::new()),
             cpu: CpuTracker::new(),
             speed: SpeedTracker::new(),

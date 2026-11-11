@@ -277,7 +277,7 @@ pub fn call_answer(state: &AppState) -> (u16, Value) {
     };
     let code = final_line(&reply);
     let answered = code == Some("OK")
-        || matches!(read_voice_calls(state), Ok(calls) if calls.iter().any(|c| c["stat"] == "active"));
+        || matches!(read_voice_calls_for_push(state), Ok(calls) if calls.iter().any(|c| c["stat"] == "active"));
     if answered {
         // An answered call is active even if the app never polls call_status;
         // the modem policies must not touch the radio while it lasts.
@@ -324,7 +324,7 @@ fn voice_call_snapshot(resp: &str) -> Result<Vec<Value>, &'static str> {
 /// command echo, then delivers that transaction's final result to the next
 /// reader. A third read lets the late packet drain without treating it as the
 /// new transaction. CLCC is read-only; call-control commands are never retried.
-fn read_voice_calls(state: &AppState) -> Result<Vec<Value>, String> {
+pub(crate) fn read_voice_calls_for_push(state: &AppState) -> Result<Vec<Value>, String> {
     let mut last = "incomplete call status response".to_string();
     for attempt in 0..3 {
         match at_cmd::send_until_final(&state.at_port, "AT+CLCC", 2) {
@@ -343,7 +343,7 @@ fn read_voice_calls(state: &AppState) -> Result<Vec<Value>, String> {
 
 /// GET /api/call/status
 pub fn call_status(state: &AppState) -> (u16, Value) {
-    match read_voice_calls(state) {
+    match read_voice_calls_for_push(state) {
         Ok(calls) => {
             state.call_active.store(!calls.is_empty(), Ordering::Relaxed);
             // A complete status with no voice call means the call ended remotely.
@@ -395,7 +395,7 @@ pub fn call_audio_start(state: &AppState, body: &[u8]) -> (u16, Value) {
         return (400, json!({"ok": false, "error": "host must be an IPv4 address"}));
     };
     let restart = parsed["restart"].as_bool().unwrap_or(false);
-    let active = match read_voice_calls(state) {
+    let active = match read_voice_calls_for_push(state) {
         Ok(calls) => calls.iter().any(|c| c["stat"] == "active"),
         Err(e) => return (503, json!({"ok": false, "error": e})),
     };

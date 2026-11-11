@@ -182,6 +182,22 @@ final class CallViewModel {
         }
     }
 
+    /// PushKit's deadline requires CallKit to be told before any network round trip. Preserve the
+    /// single CallKitManager owned by this model, then reconcile against the router asynchronously.
+    func receiveVoIPPush(number: String?) {
+        let trimmed = number?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let caller = trimmed.isEmpty ? "U60 来电" : trimmed
+        callKit.reportIncoming(number: caller)
+        phoneNumber = caller
+        callState = .incoming(from: caller)
+
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.pollCallStatus()
+            self.startPolling()
+        }
+    }
+
     private func performDial(_ number: String) async -> Bool {
         let generation = connectionGeneration
         phoneNumber = number

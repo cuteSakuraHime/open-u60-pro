@@ -16,6 +16,7 @@ mod dashboard;
 mod dashboard_extra;
 mod data_usage;
 mod device_ext;
+mod device_push;
 mod dns_control;
 pub mod doh;
 mod esim;
@@ -118,6 +119,7 @@ fn main() {
     // Event bus: single `ubus listen` process dispatches to subscribers
     let event_bus = Arc::new(EventBus::new());
     let sms_rx = event_bus.subscribe("zwrt_wms_status_event");
+    let push_sms_rx = event_bus.subscribe("zwrt_wms_status_event");
     let charger_rx = event_bus.subscribe("BSP_CHARGER_EVENT");
     let service_rx = event_bus.subscribe("zwrt_servicestatus");
     let wan_status_rx = event_bus.subscribe("router_event_wan_connect_status");
@@ -155,6 +157,7 @@ fn main() {
     state.sim_identity.start(Arc::clone(&event_bus), Arc::clone(&state.cache), identity_events);
 
     state.live_activity.start(Arc::clone(&state), apns_events);
+    state.device_push.start(Arc::clone(&state), push_sms_rx);
     if let Err(error) = dns_control::prepare_startup(&state) {
         eprintln!("[dns] startup synchronization failed: {error}");
     }

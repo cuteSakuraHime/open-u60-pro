@@ -8,16 +8,16 @@ private final class LocalSMSNotificationDelegate: NSObject, UNUserNotificationCe
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        guard notification.request.content.categoryIdentifier == "local-router-sms" else {
-            completionHandler([])
-            return
-        }
-        completionHandler([.banner, .list, .sound])
+        let content = notification.request.content
+        let isRouterMessage = content.categoryIdentifier == "local-router-sms"
+            || content.userInfo["event_token"] != nil
+        completionHandler(isRouterMessage ? [.banner, .list, .sound] : [])
     }
 }
 
 @main
 struct OpenU60App: App {
+    @UIApplicationDelegateAdaptor(PushAppDelegate.self) private var pushAppDelegate
     @State private var signalActivity: SignalActivityManager
     @Environment(\.scenePhase) private var scenePhase
     @State private var authManager: AuthManager
@@ -27,6 +27,7 @@ struct OpenU60App: App {
     @AppStorage("dark_mode_override") private var darkModeOverride: Int = 0
 
     private let client: AgentClient
+    private let pushManager: PushManager
 
     init() {
         UNUserNotificationCenter.current().delegate = LocalSMSNotificationDelegate.shared
@@ -36,7 +37,11 @@ struct OpenU60App: App {
         _signalActivity = State(initialValue: SignalActivityManager(client: agentClient))
         let authentication = AuthManager(client: agentClient)
         _authManager = State(initialValue: authentication)
-        _callModel = State(initialValue: CallViewModel(client: agentClient, authManager: authentication))
+        let calls = CallViewModel(client: agentClient, authManager: authentication)
+        _callModel = State(initialValue: calls)
+        let pushes = PushManager.shared
+        pushes.configure(client: agentClient, callModel: calls)
+        self.pushManager = pushes
 
         let navAppearance = UINavigationBarAppearance()
         navAppearance.configureWithTransparentBackground()
@@ -89,8 +94,15 @@ struct OpenU60App: App {
                     }
                 }
                 .task(id: authManager.isAuthenticated) {
-                    if authManager.isAuthenticated { await signalActivity.resume() }
-                    else if signalActivity.activity != nil { await signalActivity.stop() }
+                    if authManager.isAuthenticated {
+                        pushManager.refreshRegistration()
+                        await signalActivity.resume()
+                    } else if signalActivity.activity != nil {
+                        await signalActivity.stop()
+                    }
+                }
+                .task {
+                    pushManager.start()
                 }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active && authManager.isAuthenticated {
@@ -102,6 +114,7 @@ struct OpenU60App: App {
                 .onChange(of: gatewayIP) {
                     callModel.resetConnection()
                     client.baseURL = "http://\(gatewayIP):9090"
+                    pushManager.refreshRegistration()
                     if authManager.isAuthenticated && scenePhase == .active {
                         callModel.startPolling()
                     }

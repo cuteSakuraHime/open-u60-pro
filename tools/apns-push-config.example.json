@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "team_id": "ABCDEFGHIJ",
+  "key_id": "1234567890",
+  "bundle_id": "com.example.OpenU60",
+  "key_file": "/data/open-u60/push/AuthKey.p8",
+  "environment": "sandbox"
+}

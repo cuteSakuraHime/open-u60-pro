@@ -103,8 +103,9 @@ pub enum Pre {
 /// auth lookups, so every listener shares the exact same behaviour.
 pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
     let has_password = env.auth.has_password();
+    let capability_event = req.method == Method::Get && req.path.starts_with("/api/push/event/");
     let mut principal = None;
-    if req.path != "/api/auth/login" && has_password {
+    if req.path != "/api/auth/login" && !capability_event && has_password {
         principal = req.bearer.and_then(|t| env.auth.authenticate(Kind::Bearer, t));
         if principal.is_none() {
             return refuse(401, "unauthorized");
@@ -115,7 +116,7 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
     // API is open), with one for browser requests (`Origin` or
     // `Sec-Fetch-Site`; the apps send neither), so a rebound page cannot
     // try passwords at the login route or use up its rate limit.
-    if !has_password || req.headers.origin.is_some() || req.headers.sec_fetch_site.is_some() {
+    if capability_event || !has_password || req.headers.origin.is_some() || req.headers.sec_fetch_site.is_some() {
         let Some(host) = req.headers.host else {
             return refuse(400, "missing host");
         };
@@ -259,10 +260,18 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
     if *method != Method::Get {
         crate::httpd::gate::debug_assert_may_change(path);
     }
+    if *method == Method::Get {
+        if let Some(token) = path.strip_prefix("/api/push/event/") {
+            return state.device_push.take_event(token);
+        }
+    }
     match (method, path) {
         (&Method::Get, "/api/live-activity") => state.live_activity.status(),
         (&Method::Put, "/api/live-activity") => state.live_activity.register(body),
         (&Method::Delete, "/api/live-activity") => state.live_activity.unregister(),
+        (&Method::Get, "/api/push") => state.device_push.status(),
+        (&Method::Put, "/api/push/register") => state.device_push.register(body),
+        (&Method::Delete, "/api/push/register") => state.device_push.unregister(),
         // Auth
         // Reached only in-process (the listener takes the Login path), so no peer address.
         (&Method::Post, "/api/auth/login") => handlers::login(state, body, PeerKey::UNKNOWN),
@@ -627,6 +636,9 @@ mod tests {
         // The login route is exempt from the token check.
         assert_eq!(run(&auth, &info(Method::Post, "/api/auth/login", None, None, h)), Pre::Login);
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, h)), reply(401, "unauthorized"));
+        // A one-shot push capability is the only passwordless data route. Its opaque
+        // token is checked by DevicePush, while Host policy still blocks rebinding.
+        assert_eq!(run(&auth, &info(Method::Get, "/api/push/event/opaque", None, None, h)), DISPATCH);
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, Some("nope"), h)), reply(401, "unauthorized"));
         assert_eq!(run(&auth, &info(Method::Get, "/api/lan/ping", None, None, h)), reply(401, "unauthorized"));
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, t, h)), DISPATCH);
@@ -677,6 +689,8 @@ mod tests {
         // A rebound page posting passwords: refused before the limiter.
         let login = lan(info(Method::Post, "/api/auth/login", None, None, rebound));
         assert_eq!(run(&auth, &login), reply(403, "host not allowed"));
+        let capability = info(Method::Get, "/api/push/event/opaque", None, None, rebound);
+        assert_eq!(run(&auth, &capability), reply(403, "host not allowed"));
         let fetch_site = ReqHeaders { origin: None, sec_fetch_site: Some("same-origin"), ..rebound };
         assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, fetch_site))), reply(403, "host not allowed"));
         let no_host = ReqHeaders { host: None, ..rebound };
