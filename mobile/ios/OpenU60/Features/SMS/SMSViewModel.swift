@@ -42,10 +42,16 @@ final class SMSViewModel {
         for message in fresh {
             let content = UNMutableNotificationContent()
             content.categoryIdentifier = "local-router-sms"
-            content.title = "收到新短信"
-            content.body = "来自 \(message.number)，打开 App 查看内容与验证码。"
+            if let code = message.verificationCode {
+                content.title = "验证码 \(code)"
+                content.body = "来自 \(message.number)，打开 App 可一键复制。"
+            } else {
+                content.title = "收到新短信"
+                content.body = "来自 \(message.number)，打开 App 查看内容。"
+            }
             content.sound = .default
-            // Keep SMS content and OTPs out of notification payloads.
+            // This is a local notification created on the phone; no SMS content is sent
+            // through APNs or another server.
             let request = UNNotificationRequest(identifier: UUID().uuidString,
                                                 content: content, trigger: nil)
             do {
