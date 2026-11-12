@@ -7,6 +7,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 ### Fixed
 
 - Wait for the listening port when the agent is restarted right after the previous instance, instead of exiting with `Address in use`.
+- Create the push HTTP client only when a push provider is configured, which also lets the agent's test suite run again.
 - Make call-control AT commands return when the modem sends its final result instead of waiting for the full timeout, so dial, answer, hang-up and status polling no longer block one another.
 - Ignore firmware-reported data/fax `AT+CLCC` bearers when reporting voice-call status, and retry incomplete reads while requiring the current command echo plus final `OK`. This fixes intermittent `503 incomplete call status response` on B29 without accepting a late result from an older transaction as idle.
 - Restart and monitor the vendor RTP bridge more reliably, preserving two-way call audio across rapid call-state changes.

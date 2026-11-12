@@ -153,15 +153,19 @@ impl DevicePush {
                     && r.voip_token.as_deref().is_none_or(valid_token)
             })
             .unwrap_or_default();
-        let client = reqwest::blocking::Client::builder()
-            .https_only(true)
-            .http2_prior_knowledge()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .ok();
+        // Only with a provider: the client owns a thread and a runtime, which
+        // an agent without push credentials (and every test) must not start.
+        let client = provider.as_ref().and_then(|_| {
+            reqwest::blocking::Client::builder()
+                .https_only(true)
+                .http2_prior_knowledge()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .ok()
+        });
         Self {
             provider,
             client,
