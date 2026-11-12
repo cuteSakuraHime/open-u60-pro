@@ -58,6 +58,11 @@ pub const LAN_STREAMS: usize = 2;
 /// stay open; a longer body gets `Connection: close` instead.
 pub const DRAIN_MAX: u64 = 1024 * 1024;
 pub const DRAIN_WAIT: Duration = Duration::from_secs(2);
+/// At start the port may still belong to the agent being replaced (an update,
+/// a supervisor restart): it got its signal but has not released the socket
+/// yet. The bind is retried for this long before the start is given up.
+const BIND_WAIT: Duration = Duration::from_secs(8);
+const BIND_RETRY: Duration = Duration::from_millis(100);
 /// hyper's read buffer, which also caps the request head.
 const MAX_BUF: usize = 64 * 1024;
 
@@ -151,7 +156,7 @@ fn clamp_threads(threads: usize) -> usize {
 pub fn serve(bind: &str, threads: usize, state: Arc<AppState>) {
     let threads = clamp_threads(threads);
     let side = mobile::Guard::from_env();
-    let listener = match listen(bind) {
+    let listener = match listen_when_free(bind, BIND_WAIT) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[http] bind {bind}: {e}");
@@ -195,6 +200,25 @@ pub fn listen(bind: &str) -> std::io::Result<std::net::TcpListener> {
     set_tcp_keepalive(&listener);
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// `listen`, waiting up to `wait` for an address that is still in use. Only
+/// for the start of the process, before the runtime exists.
+fn listen_when_free(bind: &str, wait: Duration) -> std::io::Result<std::net::TcpListener> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut reported = false;
+    loop {
+        match listen(bind) {
+            Err(e) if e.kind() == ErrorKind::AddrInUse && std::time::Instant::now() < deadline => {
+                if !reported {
+                    eprintln!("[http] {bind} is still in use, waiting for it");
+                    reported = true;
+                }
+                std::thread::sleep(BIND_RETRY);
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Current-thread runtime; its blocking pool has room for every gate permit
@@ -571,6 +595,22 @@ mod tests {
         // Disabled since: the next uncontended lookup updates the answer.
         mgr.lock_config_for_test().enabled = false;
         assert!(names.get().is_empty());
+    }
+
+    #[test]
+    fn start_waits_for_a_port_the_previous_agent_still_holds() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = held.local_addr().unwrap().to_string();
+        let refused = listen_when_free(&bind, Duration::from_millis(250)).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::AddrInUse);
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let listener = listen_when_free(&bind, Duration::from_secs(10)).unwrap();
+        assert_eq!(listener.local_addr().unwrap().to_string(), bind);
+        release.join().unwrap();
     }
 }
 
