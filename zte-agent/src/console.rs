@@ -317,6 +317,14 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../ui/wireguard.js"),
         )),
+        "/console/a/clash-model.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/clash-model.js"),
+        )),
+        "/console/a/clash.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/clash.js"),
+        )),
         "/console/a/data-usage.js" => Some((
             "text/javascript; charset=utf-8",
             include_str!("../ui/data-usage.js"),
@@ -405,6 +413,8 @@ mod tests {
             ("/console/a/dns-cache.js", 200),
             ("/console/a/wireguard-model.js", 200),
             ("/console/a/wireguard.js", 200),
+            ("/console/a/clash-model.js", 200),
+            ("/console/a/clash.js", 200),
             ("/console/a/update.js", 200),
             ("/console/a/data-usage.js", 200),
             ("/ui/login", 303),

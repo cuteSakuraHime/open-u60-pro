@@ -163,9 +163,15 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
     if live_activity && !has_password {
         return refuse(403, "agent password required");
     }
-    Pre::Dispatch {
-        body_limit: if live_activity { LIVE_ACTIVITY_BODY_MAX } else { API_BODY_MAX },
-    }
+    let body_limit = if live_activity {
+        LIVE_ACTIVITY_BODY_MAX
+    } else if req.method == Method::Put && req.path == "/api/vpn/clash" {
+        // A whole Clash configuration as one JSON string.
+        crate::clash::IMPORT_BODY_MAX
+    } else {
+        API_BODY_MAX
+    };
+    Pre::Dispatch { body_limit }
 }
 
 /// `{"ok":false,"error":…}` built in one place (each `json!` site costs code size).
@@ -216,7 +222,11 @@ pub fn lane(method: Method, path: &str) -> Lane {
         | (Get, "/api/tailscale/status")
         | (Get, "/api/stk/menu" | "/api/stk/session") => false,
         (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") || p.starts_with("/api/https/") => true,
-        (Put | Post, p) if p.starts_with("/api/vpn/wireguard") || p.starts_with("/api/vpn/clash") => true,
+        (Put | Post, p) if p.starts_with("/api/vpn/wireguard") => true,
+        // The status and the in-memory log are quick reads; everything else
+        // starts or stops Mihomo, downloads, or waits for its controller.
+        (Get, "/api/vpn/clash" | "/api/vpn/clash/log") | (Delete, "/api/vpn/clash/log") => false,
+        (_, p) if p.starts_with("/api/vpn/clash") => true,
         (_, p) if p.starts_with("/api/ussd/") || p.starts_with("/api/stk/") => true,
         (Post, p) if p.starts_with("/api/sim/") || p.starts_with("/api/cell/") => true,
         (_, p) if p.starts_with("/api/dns/") => true,
@@ -423,6 +433,16 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Put, "/api/vpn/clash") => crate::clash::import(&state.clash, body),
         (&Method::Post, "/api/vpn/clash/enable") => crate::clash::enable(&state.clash),
         (&Method::Post, "/api/vpn/clash/disable") => crate::clash::disable(&state.clash),
+        (&Method::Post, "/api/vpn/clash/restart") => crate::clash::restart(&state.clash),
+        (&Method::Put, "/api/vpn/clash/settings") => crate::clash::settings(&state.clash, body),
+        (&Method::Post, "/api/vpn/clash/subscription") => crate::clash::subscribe(&state.clash, body),
+        (&Method::Delete, "/api/vpn/clash/subscription") => crate::clash::forget_subscription(&state.clash),
+        (&Method::Post, "/api/vpn/clash/china-list") => crate::clash::update_china_list(&state.clash),
+        (&Method::Get, "/api/vpn/clash/log") => crate::clash::log(&state.clash),
+        (&Method::Delete, "/api/vpn/clash/log") => crate::clash::clear_log(&state.clash),
+        (&Method::Get, "/api/vpn/clash/proxies") => crate::clash::proxies(&state.clash),
+        (&Method::Put, "/api/vpn/clash/proxies") => crate::clash::select_proxy(&state.clash, body),
+        (&Method::Post, "/api/vpn/clash/proxies/test") => crate::clash::test_group(&state.clash, body),
         (&Method::Get, "/api/router/domain-filter") => router::router_domain_filter_get(state),
         (&Method::Put, "/api/router/domain-filter") => router::router_domain_filter_set(state, body),
         (&Method::Get, "/api/router/apn/mode") => router::router_apn_mode_get(state),
@@ -789,5 +809,34 @@ mod tests {
     fn ota_download_uses_the_slow_lane_without_blocking_status() {
         assert_eq!(lane(Method::Post, "/api/update/download"), Lane::Slow);
         assert_eq!(lane(Method::Get, "/api/update/status"), Lane::General);
+    }
+
+    #[test]
+    fn clash_keeps_quick_reads_off_the_slow_lane_and_takes_whole_configurations() {
+        assert_eq!(lane(Method::Get, "/api/vpn/clash"), Lane::General);
+        assert_eq!(lane(Method::Get, "/api/vpn/clash/log"), Lane::General);
+        assert_eq!(lane(Method::Delete, "/api/vpn/clash/log"), Lane::General);
+        for (method, path) in [
+            (Method::Put, "/api/vpn/clash"),
+            (Method::Post, "/api/vpn/clash/enable"),
+            (Method::Post, "/api/vpn/clash/restart"),
+            (Method::Put, "/api/vpn/clash/settings"),
+            (Method::Post, "/api/vpn/clash/subscription"),
+            (Method::Get, "/api/vpn/clash/proxies"),
+            (Method::Post, "/api/vpn/clash/proxies/test"),
+        ] {
+            assert_eq!(lane(method, path), Lane::Slow, "{path}");
+        }
+
+        let auth = with_password();
+        let token = auth.login(PW, Kind::Bearer, peer(1), &[]).unwrap();
+        let t = Some(token.token.expose());
+        let h = host("192.168.0.1:9090");
+        assert_eq!(
+            run(&auth, &info(Method::Put, "/api/vpn/clash", None, t, h)),
+            Pre::Dispatch { body_limit: crate::clash::IMPORT_BODY_MAX }
+        );
+        assert_eq!(run(&auth, &info(Method::Put, "/api/vpn/clash/settings", None, t, h)), DISPATCH);
+        assert_eq!(run(&auth, &info(Method::Get, "/api/vpn/clash", None, t, h)), DISPATCH);
     }
 }

@@ -1,0 +1,44 @@
+'use strict';
+const assert=require('node:assert/strict'),C=require('../clash-model.js');
+const profile='port: 7890\r\nmode: rule\r\ndns:\r\n  enable: true\r\n  nameserver:\r\n    - 223.5.5.5\r\nproxies:\r\n  - {name: one, type: ss, server: a.example, port: 443}\r\n  - name: two\r\n    type: trojan\r\n    server: b.example\r\nproxy-providers:\r\n  first:\r\n    type: http\r\n  second:\r\n    type: file\r\nproxy-groups:\r\n- name: Auto\r\n  type: select\r\n  proxies: [one, two]\r\nrules:\r\n- DOMAIN-SUFFIX,example.com,Auto\r\n# a comment\r\n- MATCH,DIRECT\r\n';
+const info=C.inspect(profile);
+assert.deepEqual({proxies:info.proxies,proxy_providers:info.proxy_providers,proxy_groups:info.proxy_groups,rules:info.rules,has_dns:info.has_dns},{proxies:2,proxy_providers:2,proxy_groups:1,rules:2,has_dns:true});
+assert.equal(info.recognised,true);assert.equal(info.encoded,false);assert.equal(info.tooLarge,false);
+assert.equal(C.inspect('\uFEFFmode: rule\n').recognised,true,'a byte-order mark is ignored');
+assert.equal(C.inspect('dns:\n  # nothing yet\nrules:\n  - MATCH,DIRECT\n').has_dns,false);
+const shareLinks=C.inspect('c3M6Ly9hYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODk=\n');
+assert.equal(shareLinks.recognised,false);assert.equal(shareLinks.encoded,true);
+assert.equal(C.inspect('hello: world\n').recognised,false);assert.equal(C.inspect('hello: world\n').encoded,false);
+assert.equal(C.inspect(`rules:\n${'  - MATCH,DIRECT\n'.repeat(70000)}`).tooLarge,true);
+assert.equal(C.inspect('proxies: [{name: flow}]\nurl: http://example.com:80/x\n').proxies,0,'flow sequences are left for the router to count');
+
+assert.equal(C.counts({proxies:1,proxy_providers:0,proxy_groups:2,rules:1}),'1 proxy · 2 groups · 1 rule');
+assert.equal(C.counts({proxies:0,proxy_providers:3,proxy_groups:1,rules:40}),'0 proxies · 3 providers · 1 group · 40 rules');
+assert.equal(C.counts(null),'—');
+assert.equal(C.version('Mihomo Meta v1.19.34 linux arm64 with go1.26.11 Wed Nov 11 06:48:46 UTC 2026'),'v1.19.34');
+assert.equal(C.version('Mihomo Meta alpha-0123abc linux arm64'),'Mihomo Meta alpha-0123abc linux arm64');
+assert.equal(C.version(null),'—');
+assert.equal(C.duration(59),'59s');assert.equal(C.duration(3599),'59m');assert.equal(C.duration(3600*5+120),'5h 2m');assert.equal(C.duration(86400*2+3600*3),'2d 3h');
+assert.equal(C.uptime(65),'1m');assert.equal(C.uptime(0),'0s');assert.equal(C.uptime(null),'—');assert.equal(C.uptime(undefined),'—');
+assert.equal(C.ago(970,1000),'30s ago');assert.equal(C.ago(0,1000),'never');assert.equal(C.ago(970,undefined),'at an unknown time','the browser clock is never a fallback');assert.equal(C.ago(1000,970),'0s ago');
+
+const base={installed:true,configured:true,enabled:true,running:true,transparent_active:false,proxy_address:'192.168.0.1:7890',settings:{transparent:false},last_error:null};
+assert.equal(C.phase(null).tone,'idle');
+assert.equal(C.phase({...base,installed:false}).badge,'CORE MISSING');
+assert.equal(C.phase({...base,configured:false,enabled:false,running:false}).badge,'NO PROFILE');
+assert.equal(C.phase({...base,enabled:false,running:false}).badge,'OFF');
+assert.equal(C.phase(base).badge,'RUNNING');assert.match(C.phase(base).detail,/192\.168\.0\.1:7890/);
+assert.deepEqual([C.phase({...base,transparent_active:true,settings:{transparent:true}}).badge,C.phase({...base,transparent_active:true,settings:{transparent:true}}).tone],['TRANSPARENT','active']);
+const unprotected=C.phase({...base,settings:{transparent:true},last_error:'transparent proxy is not active: ipset failed'});
+assert.equal(unprotected.tone,'error');assert.match(unprotected.detail,/direct path/);assert.match(unprotected.detail,/ipset failed/);
+const stopped=C.phase({...base,running:false,last_error:'Mihomo exited (exit status: 1)'});
+assert.equal(stopped.badge,'NEEDS ATTENTION');assert.match(stopped.detail,/exit status: 1/);
+
+assert.deepEqual(C.delay(null),{text:'—',tone:'none'});assert.deepEqual(C.delay(0),{text:'Timeout',tone:'bad'});
+assert.deepEqual(C.delay(120),{text:'120 ms',tone:'good'});assert.equal(C.delay(400).tone,'fair');assert.equal(C.delay(900).tone,'bad');
+const saved={transparent:false,udp:true,dns_hijack:true,bypass_china:false,log_level:'warning'};
+assert.deepEqual(C.patch(saved,{...saved}),{});
+assert.deepEqual(C.patch(saved,{...saved,transparent:true,log_level:'info',unknown:1}),{transparent:true,log_level:'info'});
+assert.equal(C.subscriptionUrl('  https://provider.example/sub?token=abc  '),'https://provider.example/sub?token=abc');
+for(const bad of ['','ftp://provider.example/sub','https://provider.example/a b','javascript:alert(1)',`https://provider.example/${'a'.repeat(2048)}`])assert.equal(C.subscriptionUrl(bad),'',bad.slice(0,40));
+console.log('Passed: Clash profile preview, status phases, latency tones, settings patch and subscription links.');

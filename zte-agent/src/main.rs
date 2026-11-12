@@ -9,6 +9,8 @@ mod cache;
 mod cell;
 mod charge_policy;
 mod clash;
+mod clash_config;
+mod clash_proxy;
 mod conn_watchdog;
 mod client_details;
 mod console;
@@ -31,6 +33,7 @@ mod key_log;
 mod lan_test;
 mod live_activity;
 mod modem_ext;
+mod net_rules;
 mod network_ext;
 mod oos_policy;
 mod ota;
@@ -162,8 +165,7 @@ fn main() {
         eprintln!("[dns] startup synchronization failed: {error}");
     }
     state.doh.auto_start();
-    state.clash.auto_start();
-    state.clash.start_wan_watch(clash_wan_rx);
+    state.clash.start(clash_wan_rx);
     dns_control::start_network_watch(Arc::clone(&state), dns_network_rx);
     state.scheduler.start(Arc::clone(&state));
     state

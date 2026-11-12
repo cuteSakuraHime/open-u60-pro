@@ -30,14 +30,32 @@ Tools → Battery & Power subscribes to the optional `power` topic (five-second 
 
 Battery and USB power use measured voltage × current with µV/µA conversion, independently of unreliable driver `power_now`. Battery flow and USB input are separate. Kernel time estimates use seconds; the existing firmware estimates use minutes. Nonpositive/sentinel estimates are unavailable, and charging estimates are suppressed outside charging/full state. Raw source fields remain available in a collapsed details section. Missing data is not zero; interrupted streams retain values with a stale caption, and locking or leaving the page clears its optional data.
 
+## Clash proxy
+
+Network → Clash Proxy manages a Mihomo (Clash.Meta) core that the user installs at `/data/open-u60/clash/mihomo`; the agent does not ship or download the core. The page never polls: it reads `GET /api/vpn/clash` when the route opens, on the dashboard snapshot and when the tab regains focus, and reads policy groups and the log only on demand. Durations come from the router (`uptime`, `now`), never from the browser clock, which may be hours away from the router’s.
+
+A profile is pasted as YAML or downloaded from a subscription link (`clash.meta` user agent, 1 MiB limit). It is stored with mode 0600 and is never returned by the API; the page shows only counts of proxies, groups and rules, and only the host of a saved subscription link. Mihomo runs a runtime copy in which the router owns the listeners (mixed port 7890, redirect port 7892, DNS 1053), the loopback controller and its per-start secret, the log level and the TUN section, and Mihomo validates that copy before it replaces the running one. A refused profile leaves the previous one running.
+
+Transparent proxy redirects IPv4 TCP from `br-lan` clients to the redirect port, routes their UDP into a TUN device the agent owns (mark `0x2000000`, table 120, rule priority 990) and answers their DNS from the profile’s `dns` section or a built-in resolver. Everything lives in `OPENU60_CLASH*` chains and `openu60_clash_*` ipsets, so turning it off restores the firmware’s forwarding exactly. The router’s own traffic and private destinations are never diverted. IPv6 is not proxied; only client DNS over IPv6 is intercepted.
+
+Keep mainland China addresses direct skips Mihomo for destinations in a downloaded IPv4 list, so the profile’s rules do not see those connections. The bypass matches destination addresses: while it is on, the built-in resolver returns real addresses (`redir-host`) instead of fake ones. A profile that brings its own fake-ip `dns` section is left as written, and then only connections made to literal addresses are bypassed unless that section’s `fake-ip-filter` returns real addresses for mainland names.
+
+Failure behaviour, measured on a U60 Pro:
+
+- Mihomo exits: the diverting jumps are removed within about 100 ms and clients are direct again. A core that had run for at least a minute is restarted once.
+- Something removes the jumps: `clash-guard` reinstalls them within 60 seconds. Until then names that were answered with fake addresses do not connect. `fw3 reload` on this firmware leaves the jumps in place.
+- The agent itself is killed: Mihomo exits with it and the rules stop matching when their guard entries expire, at most 180 seconds later. LAN clients are offline for that time unless the agent is restarted sooner.
+
+Slow requests (import, enable, restart, settings, subscription, policy groups) run on the slow work lane; status and log reads do not.
 ## Source and checks
 
 - `zte-agent/ui/`: dependency-free HTML, CSS and browser modules.
 - `src/console.rs`: static shell/assets and Host/CSP handling.
 - `src/dashboard.rs`, `dashboard_extra.rs`, `client_details.rs`: demand-driven readings, bounded async SSE and client measurements.
+- `src/clash.rs`, `clash_config.rs`, `clash_proxy.rs`, `net_rules.rs`: Mihomo process and API, runtime configuration, transparent-proxy rules and the shared iptables/ipset helpers.
 - `ui/tests/`: pure Node validation checks and Playwright browser fixtures. They never contact a router or mutate real settings.
 
-Run pure checks with Node (`actions`, `advanced`, `battery-model`, `cellular`, `clients-model`, `esim-model`, `routing-model`). Browser suites (`https`, `battery`, `dashboard`, `controls`, `workspaces`, `routing`, `clients`, `esim`, `session`, `numbers`, `navigation`) use Playwright with Chrome; `navigation` also uses WebKit. `PLAYWRIGHT_WEBKIT_EXECUTABLE` can select an installed bundle outside Playwright’s default path. Rust checks use `cargo test -p zte-agent --locked` and the normal aarch64-musl release build.
+Run pure checks with Node (`actions`, `advanced`, `battery-model`, `cellular`, `clash-model`, `clients-model`, `esim-model`, `routing-model`). Browser suites (`https`, `battery`, `dashboard`, `controls`, `workspaces`, `routing`, `clients`, `clash`, `esim`, `session`, `numbers`, `navigation`) use Playwright with Chrome; `navigation` also uses WebKit. `PLAYWRIGHT_WEBKIT_EXECUTABLE` can select an installed bundle outside Playwright’s default path. Rust checks use `cargo test -p zte-agent --locked` and the normal aarch64-musl release build.
 
 ## Public screenshots
 

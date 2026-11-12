@@ -210,7 +210,7 @@ fn spawn_ubus_listen(patterns: &[String]) -> Result<Child, String> {
 /// `ubus listen` die together with the agent instead of lingering as an
 /// orphan after a `killall zte-agent`.
 #[cfg(target_os = "linux")]
-fn die_with_parent(cmd: &mut Command) {
+pub(crate) fn die_with_parent(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     let parent = std::process::id();
@@ -231,7 +231,7 @@ fn die_with_parent(cmd: &mut Command) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn die_with_parent(_cmd: &mut Command) {}
+pub(crate) fn die_with_parent(_cmd: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
