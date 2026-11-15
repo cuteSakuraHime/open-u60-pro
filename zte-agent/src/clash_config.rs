@@ -22,6 +22,13 @@ pub const DNS_PORT: u16 = 1053;
 pub const CONTROLLER_PORT: u16 = 9091;
 pub const CONTROLLER: &str = "127.0.0.1:9091";
 
+/// Used when the imported file has no `ntp` section. Mihomo then measures
+/// its own offset from real time and leaves the system clock alone. This
+/// firmware keeps local time in a clock it labels UTC, so the clock is hours
+/// away from real time, and a Shadowsocks 2022 server refuses a handshake
+/// whose timestamp is more than 30 seconds off.
+const DEFAULT_NTP: &str = "ntp:\n  enable: true\n  write-to-system: false\n  server: ntp.aliyun.com\n  port: 123\n  interval: 30\n";
+
 /// Top-level keys the runtime copy never takes from the imported file.
 const OWNED: &[&str] = &[
     "port",
@@ -225,8 +232,10 @@ pub fn compose(user: &str, options: &RuntimeOptions) -> Result<String, String> {
     let mut out = String::with_capacity(text.len() + 1024);
     let mut recognised = false;
     let mut has_dns = false;
+    let mut has_ntp = false;
     for block in blocks(text) {
         recognised |= block.key.is_some_and(|key| RECOGNISED.contains(&key));
+        has_ntp |= block.key == Some("ntp");
         match block.key {
             Some(key) if OWNED.contains(&key) => {}
             Some("dns") => {
@@ -251,6 +260,9 @@ pub fn compose(user: &str, options: &RuntimeOptions) -> Result<String, String> {
     }
     if options.dns_hijack && !has_dns {
         out.push_str(&default_dns(options.lan_address, options.real_addresses));
+    }
+    if !has_ntp {
+        out.push_str(DEFAULT_NTP);
     }
     if options.tun {
         // A plain device: the agent installs the one route and the rules that
@@ -366,6 +378,20 @@ mod tests {
         assert_eq!(top_level(&runtime, "mode"), ["mode: rule"]);
         assert!(runtime.contains("- DOMAIN-SUFFIX,example.com,Auto\n- MATCH,DIRECT\n"));
         assert!(runtime.contains("    password: q\n"));
+    }
+
+    #[test]
+    fn mihomo_keeps_its_own_clock_unless_the_file_sets_one() {
+        let runtime = compose(SUBSCRIPTION, &options(false)).unwrap();
+        assert_eq!(top_level(&runtime, "ntp").len(), 1);
+        // The default only corrects Mihomo: the router's clock is the firmware's.
+        assert!(runtime.contains("ntp:\n  enable: true\n  write-to-system: false\n"));
+
+        let own = format!("{SUBSCRIPTION}ntp:\n  enable: false\n");
+        let kept = compose(&own, &options(false)).unwrap();
+        assert_eq!(top_level(&kept, "ntp").len(), 1);
+        assert!(kept.contains("ntp:\n  enable: false\n"));
+        assert!(!kept.contains("write-to-system"));
     }
 
     #[test]

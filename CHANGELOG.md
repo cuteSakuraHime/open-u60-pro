@@ -12,6 +12,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ### Fixed
 
+- Let Mihomo measure its own clock offset over NTP when the profile has no `ntp` section. The firmware clock is hours away from real time, which made every Shadowsocks 2022 node fail its handshake and latency test. The router’s clock is not changed.
 - Wait for the listening port when the agent is restarted right after the previous instance, instead of exiting with `Address in use`.
 - Create the push HTTP client only when a push provider is configured, which also lets the agent's test suite run again.
 - Make call-control AT commands return when the modem sends its final result instead of waiting for the full timeout, so dial, answer, hang-up and status polling no longer block one another.
