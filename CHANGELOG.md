@@ -8,6 +8,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 - Network → Clash Proxy in the console: status and uptime of a user-installed Mihomo core, policy-group selection and latency tests, profile import by pasted YAML or subscription link, and the core log. Profiles and subscription links are stored on the router and never shown again.
 - Transparent proxy for every connected device: IPv4 TCP redirect, UDP through a router-owned TUN device and DNS interception, with an optional mainland China bypass. The rules are removed when the core stops and stop matching within three minutes if the agent itself stops.
+- Optional Clash dashboard, off by default: Mihomo serves a dashboard the owner copied to `/data/open-u60/clash/ui` on the LAN address (port 9091) without a password. While it is on, every device connected to the router can control the core; the mobile-data side cannot reach it.
 
 ### Fixed
 

@@ -39,6 +39,15 @@ assert.deepEqual(C.delay(120),{text:'120 ms',tone:'good'});assert.equal(C.delay(
 const saved={transparent:false,udp:true,dns_hijack:true,bypass_china:false,log_level:'warning'};
 assert.deepEqual(C.patch(saved,{...saved}),{});
 assert.deepEqual(C.patch(saved,{...saved,transparent:true,log_level:'info',unknown:1}),{transparent:true,log_level:'info'});
+const board={installed:true,active:false,url:null},served={installed:true,active:true,url:'http://192.168.0.1:9091/ui/?hostname=192.168.0.1&port=9091'};
+assert.deepEqual(C.dashboard(null),{tone:'idle',text:'—',url:''});
+assert.match(C.dashboard({running:true,settings:saved,dashboard:board}).text,/Installed and closed/);
+assert.match(C.dashboard({running:true,settings:saved,dashboard:{...board,installed:false}}).text,/No dashboard is installed.*\/data\/open-u60\/clash\/ui/);
+assert.deepEqual(C.dashboard({running:true,settings:{...saved,dashboard:true},dashboard:served}),{tone:'active',text:'Open at 192.168.0.1:9091/ui/ to every device on this router, without a password.',url:'http://192.168.0.1:9091/ui/?hostname=192.168.0.1&port=9091'});
+assert.equal(C.dashboard({running:true,settings:{...saved,dashboard:true},dashboard:board}).tone,'error','asked for but not served');
+assert.match(C.dashboard({running:false,settings:{...saved,dashboard:true},dashboard:board}).text,/served while the core is running/);
+for(const url of ['javascript:alert(1)','https://192.168.0.1:9091/ui/','http://user:pw@192.168.0.1:9091/ui/',null])assert.equal(C.dashboard({running:true,settings:{...saved,dashboard:true},dashboard:{...served,url}}).url,'',String(url));
+assert.equal(C.dashboard({running:true,settings:{...saved,dashboard:true},dashboard:{...served,active:false}}).url,'','a link only while it is served');
 assert.equal(C.subscriptionUrl('  https://provider.example/sub?token=abc  '),'https://provider.example/sub?token=abc');
 for(const bad of ['','ftp://provider.example/sub','https://provider.example/a b','javascript:alert(1)',`https://provider.example/${'a'.repeat(2048)}`])assert.equal(C.subscriptionUrl(bad),'',bad.slice(0,40));
-console.log('Passed: Clash profile preview, status phases, latency tones, settings patch and subscription links.');
+console.log('Passed: Clash profile preview, status phases, latency tones, settings patch, dashboard link and subscription links.');

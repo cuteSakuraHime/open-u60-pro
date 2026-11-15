@@ -47,6 +47,13 @@
   proxyPanel.append(el('p','panel-note','IPv6 is not proxied: only client DNS over IPv6 is intercepted, and the built-in resolver returns IPv4 answers so traffic matched by the rules stays on the proxied IPv4 path.'));
   const proxyText = UI.status(proxyPanel);
 
+  // The dashboard Mihomo serves itself, for what this page does not do.
+  const dashPanel = UI.panel(route,'clash-dashboard','Dashboard','Open a full Clash dashboard served by Mihomo on the router: live connections, rules, traffic and every policy group. It stays closed until you turn it on.');
+  const dashRow = el('div','clash-inline'), dashInfo = el('span','','—'), dashLink = el('a','button','Open dashboard'), dashActions = el('div','form-actions'), dashToggle = button('Turn on dashboard',toggleDashboard,'primary');
+  dashLink.target = '_blank'; dashLink.rel = 'noopener noreferrer'; dashLink.hidden = true; dashRow.append(dashInfo,dashLink); dashActions.append(dashToggle); dashPanel.append(dashRow,dashActions);
+  dashPanel.append(el('p','panel-note','While it is on, the Mihomo controller listens on the router’s LAN address without a password instead of on the router itself. Any device connected to this router can then switch nodes, read every connection and change the running configuration, and this console’s sign-in does not protect it.'));
+  const dashText = UI.status(dashPanel);
+
   // Profile: pasted YAML or a subscription link. Neither is ever read back from the router.
   const profilePanel = UI.panel(route,'clash-profile','Profile','Paste a Clash or Mihomo YAML profile. The router keeps its own listeners, controller and log level, checks the file with Mihomo, and only then replaces the running profile.');
   const profileForm = el('form','settings-form clash-profile-form'), profileFields = el('fieldset','form-grid'), profileField = el('div','form-field clash-config-field'), profileLabel = el('label','','Profile YAML'), textarea = el('textarea','mono');
@@ -85,6 +92,13 @@
     const list = current?.china_list;
     chinaInfo.textContent = list?.updated_at ? `Mainland China list: ${list.entries ?? '—'} networks · updated ${M.ago(list.updated_at,current.now)}` : 'Mainland China list: not downloaded';
     chinaUpdate.textContent = list?.updated_at ? 'Update list' : 'Download list'; chinaUpdate.disabled = !current || !ready();
+  }
+  function drawDashboard() {
+    const view = M.dashboard(current), on = !!current?.settings?.dashboard;
+    dashPanel.dataset.state = view.tone; dashInfo.textContent = view.text; dashLink.hidden = !view.url;
+    if (view.url) dashLink.href = view.url; else dashLink.removeAttribute('href');
+    dashToggle.textContent = on ? 'Turn off dashboard' : 'Turn on dashboard'; dashToggle.className = `button ${on ? 'danger' : 'primary'}`;
+    dashToggle.disabled = !ready() || !current || (!on && !current.dashboard?.installed);
   }
   function drawProfile() {
     const text = textarea.value; profileDirty = !!text.trim(); profilePanel.dataset.dirty = String(profileDirty);
@@ -138,7 +152,7 @@
     toggle.disabled = !ready() || !data || (!enabled && (!data.installed || !data.configured));
     restart.disabled = !ready() || !enabled; refresh.disabled = loading || API.locked || !API.connected;
     readLog.disabled = clearLog.disabled = !data || !ready();
-    drawSettings(); drawProfile(); drawLink(); drawGroups();
+    drawSettings(); drawDashboard(); drawProfile(); drawLink(); drawGroups();
   }
 
   async function readStatus() { current = await request('/api/vpn/clash'); if (!current.running) groups = null; }
@@ -208,6 +222,17 @@
   async function updateChinaList() {
     await act(proxyText,'Downloading the mainland China address list…',() => request('/api/vpn/clash/china-list',{...json('POST',{}),timeoutMs:SLOW}),data => { adopt(data); say(proxyText,`Mainland China list updated: ${data.china_list?.entries ?? '—'} networks.`); });
   }
+  async function toggleDashboard() {
+    if (!current || loading) return; const opening = !current.settings?.dashboard, running = !!current.running;
+    const restarts = running ? ' Mihomo restarts to apply this; connections through the proxy are dropped for a few seconds.' : '';
+    const text = opening ? `Every device connected to this router will be able to open the dashboard and control the core without a password: switch nodes, read every connection and change the running configuration.${restarts}`
+      : `The dashboard closes and the controller answers only on the router itself again, behind a secret that changes at every start.${restarts}`;
+    if (!await confirm(opening ? 'Turn on the dashboard?' : 'Turn off the dashboard?',text,{label:opening ? 'Turn on dashboard' : 'Turn off dashboard'})) return;
+    await act(dashText,opening ? 'Opening the dashboard…' : 'Closing the dashboard…',() => request('/api/vpn/clash/settings',{...json('PUT',{dashboard:opening}),timeoutMs:SLOW}),data => {
+      adopt(data); const served = !!data.dashboard?.active;
+      say(dashText,!opening ? 'Dashboard closed.' : served ? 'Dashboard is open.' : data.running ? 'Saved, but the dashboard is not served. Restart the core.' : 'Saved. The dashboard opens when Clash is enabled.',opening && !served && !!data.running);
+    });
+  }
   async function forgetSubscription() {
     if (!current?.subscription || !await confirm('Forget the subscription link?','The stored link is deleted from the router. The profile downloaded from it stays in use.',{label:'Forget link',destructive:true})) return;
     await act(linkText,'Removing the stored link…',() => request('/api/vpn/clash/subscription',{method:'DELETE'}),data => { adopt(data); say(linkText,'Subscription link removed.'); });
@@ -251,7 +276,7 @@
   document.addEventListener('visibilitychange',() => { if (!document.hidden) refreshVisible(); });
   UI.track({route,get loaded() { return attempted; },get dirty() { return profileDirty || linkDirty || settingsDirty; },load:() => load(true),refresh:() => load(true),clear() {
     current = null; groups = null; attempted = false; loading = false; settingsDirty = false; openGroups.clear(); textarea.value = ''; link.value = ''; showLog('');
-    for (const node of [statusText,groupsText,proxyText,profileText,linkText,logText]) say(node,''); draw();
+    for (const node of [statusText,groupsText,proxyText,dashText,profileText,linkText,logText]) say(node,''); draw();
   }});
   showLog(''); draw();
 })();

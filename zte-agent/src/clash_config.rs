@@ -2,11 +2,11 @@
 //!
 //! The imported YAML is kept as the user wrote it. What Mihomo reads is a
 //! runtime copy in which the settings the router must own are replaced:
-//! listeners, the controller and its secret, logging, and anything that would
-//! let Mihomo rewrite the router's own routes or firewall (TUN, its iptables
-//! helper). Subscription files routinely set those to values that clash with
-//! the agent (a controller on port 9090, for one), so they are dropped rather
-//! than rejected.
+//! listeners, the controller, its secret and the dashboard it serves,
+//! logging, and anything that would let Mihomo rewrite the router's own
+//! routes or firewall (TUN, its iptables helper). Subscription files
+//! routinely set those to values that clash with the agent (a controller on
+//! port 9090, for one), so they are dropped rather than rejected.
 //!
 //! No YAML parser is linked. Top-level keys start in column 0, so the file is
 //! handled as a list of top-level blocks; Mihomo itself validates the result
@@ -19,6 +19,7 @@ pub const REDIR_PORT: u16 = 7892;
 /// The TUN device that carries LAN clients' UDP while it is intercepted.
 pub const TUN_DEVICE: &str = "ouclash0";
 pub const DNS_PORT: u16 = 1053;
+pub const CONTROLLER_PORT: u16 = 9091;
 pub const CONTROLLER: &str = "127.0.0.1:9091";
 
 /// Top-level keys the runtime copy never takes from the imported file.
@@ -59,7 +60,9 @@ const RECOGNISED: &[&str] = &[
 ];
 
 pub struct RuntimeOptions<'a> {
+    /// Guards the loopback controller; unused while a dashboard is served.
     pub secret: &'a str,
+    pub dashboard: Option<Dashboard<'a>>,
     pub log_level: &'a str,
     pub dns_hijack: bool,
     /// Make the built-in resolver answer with real addresses, so that
@@ -68,6 +71,30 @@ pub struct RuntimeOptions<'a> {
     /// Create the TUN device that LAN clients' UDP is routed into.
     pub tun: bool,
     pub lan_address: Ipv4Addr,
+}
+
+/// A dashboard that Mihomo serves itself. The controller then listens on the
+/// LAN address instead of loopback and asks for no secret, so anything that
+/// can reach that address controls the core.
+#[derive(Clone, Copy)]
+pub struct Dashboard<'a> {
+    pub address: Ipv4Addr,
+    /// The directory with the dashboard's `index.html`.
+    pub directory: &'a str,
+}
+
+/// Where the controller listens. Browsers are told to let only the
+/// dashboard's own pages read the API: Mihomo's default allows every site.
+fn controller(options: &RuntimeOptions) -> String {
+    match options.dashboard {
+        Some(Dashboard { address, directory }) => format!(
+            "external-controller: {address}:{CONTROLLER_PORT}\nsecret: ''\nexternal-ui: '{directory}'\nexternal-controller-cors:\n  allow-origins:\n    - http://{address}:{CONTROLLER_PORT}\n  allow-private-network: false\n"
+        ),
+        None => format!(
+            "external-controller: {CONTROLLER}\nsecret: '{}'\n",
+            options.secret
+        ),
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -233,8 +260,9 @@ pub fn compose(user: &str, options: &RuntimeOptions) -> Result<String, String> {
         ));
     }
     out.push_str(&format!(
-        "# Managed by OpenU60: listeners, controller and logging.\nmixed-port: {MIXED_PORT}\nredir-port: {REDIR_PORT}\nallow-lan: true\nbind-address: '*'\nexternal-controller: {CONTROLLER}\nsecret: '{}'\nlog-level: {}\n",
-        options.secret, options.log_level
+        "# Managed by OpenU60: listeners, controller and logging.\nmixed-port: {MIXED_PORT}\nredir-port: {REDIR_PORT}\nallow-lan: true\nbind-address: '*'\n{}log-level: {}\n",
+        controller(options),
+        options.log_level
     ));
     Ok(out)
 }
@@ -297,6 +325,7 @@ mod tests {
     fn options(dns_hijack: bool) -> RuntimeOptions<'static> {
         RuntimeOptions {
             secret: "controller-fixture",
+            dashboard: None,
             log_level: "warning",
             dns_hijack,
             real_addresses: false,
@@ -337,6 +366,46 @@ mod tests {
         assert_eq!(top_level(&runtime, "mode"), ["mode: rule"]);
         assert!(runtime.contains("- DOMAIN-SUFFIX,example.com,Auto\n- MATCH,DIRECT\n"));
         assert!(runtime.contains("    password: q\n"));
+    }
+
+    #[test]
+    fn a_dashboard_moves_the_controller_to_the_lan_address_without_a_secret() {
+        let imported = format!(
+            "{SUBSCRIPTION}external-ui: /etc\nexternal-ui-url: https://example.com/ui.zip\nexternal-controller-cors:\n  allow-origins:\n    - '*'\n"
+        );
+        let closed = compose(&imported, &options(false)).unwrap();
+        for key in ["external-ui", "external-ui-url", "external-controller-cors"] {
+            assert!(top_level(&closed, key).is_empty(), "{key} must be dropped");
+        }
+
+        let open = compose(
+            &imported,
+            &RuntimeOptions {
+                dashboard: Some(Dashboard {
+                    address: LAN,
+                    directory: "/data/open-u60/clash/ui",
+                }),
+                ..options(false)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            top_level(&open, "external-controller"),
+            ["external-controller: 192.168.0.1:9091"]
+        );
+        assert_eq!(top_level(&open, "secret"), ["secret: ''"]);
+        assert_eq!(
+            top_level(&open, "external-ui"),
+            ["external-ui: '/data/open-u60/clash/ui'"]
+        );
+        assert!(open.contains(
+            "external-controller-cors:\n  allow-origins:\n    - http://192.168.0.1:9091\n  allow-private-network: false\n"
+        ));
+        // Nothing makes Mihomo download a dashboard, and no other address is opened.
+        assert!(top_level(&open, "external-ui-url").is_empty());
+        assert!(!open.contains("0.0.0.0"));
+        assert!(!open.contains("controller-fixture"));
+        assert!(!open.contains("example.com/ui.zip"));
     }
 
     #[test]

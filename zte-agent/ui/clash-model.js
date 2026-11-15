@@ -90,10 +90,23 @@
     for (const key of SETTINGS) if (draft?.[key] !== undefined && draft[key] !== baseline?.[key]) changed[key] = draft[key];
     return changed;
   }
+  // What the page says about the dashboard Mihomo can serve, and the link to
+  // it. The link is shown only while that start of the core really serves it.
+  function dashboard(data) {
+    if (!data) return {tone:'idle',text:'—',url:''};
+    const info = data.dashboard || {}, wanted = !!data.settings?.dashboard;
+    let url = '', address = '';
+    try { const parsed = new URL(info.active ? info.url : ''); if (parsed.protocol === 'http:' && !parsed.username && !parsed.password) { url = parsed.href; address = `${parsed.host}${parsed.pathname}`; } } catch { /* No link is shown. */ }
+    if (url) return {tone:'active',text:`Open at ${address} to every device on this router, without a password.`,url};
+    if (!info.installed) return {tone:wanted ? 'error' : 'idle',text:'No dashboard is installed. Copy one (its index.html and assets) to /data/open-u60/clash/ui on the router.',url};
+    if (wanted && data.running) return {tone:'error',text:'Turned on, but not served: the controller is still private. Restart the core.',url};
+    if (wanted) return {tone:'idle',text:'Turned on. It is served while the core is running.',url};
+    return {tone:'idle',text:'Installed and closed. The controller answers only on the router itself.',url};
+  }
   function subscriptionUrl(text) {
     const url = String(text || '').trim();
     return /^https?:\/\/[^\s\x00-\x1f\x7f]+$/.test(url) && url.length <= MAX_URL ? url : '';
   }
-  const api = {MAX_CONFIG,LOG_LEVELS,inspect,counts,version,duration,uptime,ago,phase,delay,patch,subscriptionUrl};
+  const api = {MAX_CONFIG,LOG_LEVELS,inspect,counts,version,duration,uptime,ago,phase,delay,patch,dashboard,subscriptionUrl};
   if (typeof module === 'object' && module.exports) module.exports = api; else globalThis.OpenU60Clash = api;
 })(globalThis);

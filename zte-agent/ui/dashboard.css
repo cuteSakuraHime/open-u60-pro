@@ -3303,7 +3303,11 @@ button.clash-member:hover:not(:disabled) { border-color:var(--control-border-hov
 .clash-log-view { max-height:420px; min-height:120px; margin:0; padding:16px 18px; overflow:auto; border:1px solid var(--line); border-radius:5px; background:var(--surface-soft); color:var(--ink); font:11px/1.75 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; }
 .clash-log-view[data-empty="true"] { color:var(--muted); }
 #clash-status .action-status,#clash-groups .action-status { margin-top:16px; }
-#clash-transparent > .panel-note,#clash-subscription > .panel-note { margin:24px 0 0; line-height:1.7; }
+#clash-transparent > .panel-note,#clash-dashboard > .panel-note,#clash-subscription > .panel-note { margin:24px 0 0; line-height:1.7; }
+#clash-dashboard .clash-inline { margin:0 0 18px; }
+#clash-dashboard .clash-inline span { flex:1 1 240px; min-width:0; line-height:1.6; overflow-wrap:anywhere; }
+#clash-dashboard[data-state="active"] .clash-inline { border-style:solid; border-color:var(--warning-border); background:var(--warning-surface); color:var(--warning-ink); }
+#clash-dashboard[data-state="error"] .clash-inline { color:var(--warning-ink); }
 @media(max-width:900px) {
   .clash-facts { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .clash-facts div+div { border-left:0; }

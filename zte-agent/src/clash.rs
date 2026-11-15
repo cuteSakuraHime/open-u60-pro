@@ -5,7 +5,9 @@
 //! listeners ([`crate::clash_config`]) and checked by Mihomo itself before it
 //! replaces the running one. The controller listens on loopback behind a
 //! secret that changes at every start; the console reaches it only through
-//! this module.
+//! this module. The owner can open a dashboard instead
+//! ([`Settings::dashboard`]): the controller then listens on the LAN address
+//! without a secret and Mihomo serves the dashboard files the owner installed.
 //!
 //! LAN clients can always opt in through the mixed HTTP/SOCKS port. The
 //! transparent proxy ([`crate::clash_proxy`]) is installed only after Mihomo
@@ -32,7 +34,9 @@ use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::clash_config::{self, RuntimeOptions, Summary, CONTROLLER, MIXED_PORT, TUN_DEVICE};
+use crate::clash_config::{
+    self, Dashboard, RuntimeOptions, Summary, CONTROLLER, CONTROLLER_PORT, MIXED_PORT, TUN_DEVICE,
+};
 use crate::clash_proxy::{self, Plan};
 use crate::net_rules;
 
@@ -46,6 +50,10 @@ const STATE: &str = "/data/open-u60/clash/state.json";
 const STATE_NEW: &str = "/data/open-u60/clash/state.json.new";
 const CHINA_LIST: &str = "/data/open-u60/clash/china_ip_list.txt";
 const CHINA_LIST_NEW: &str = "/data/open-u60/clash/china_ip_list.txt.new";
+/// A dashboard is installed by the owner, like the core. It is inside the
+/// directory Mihomo runs in, the only place Mihomo serves files from.
+const DASHBOARD: &str = "/data/open-u60/clash/ui";
+const DASHBOARD_INDEX: &str = "/data/open-u60/clash/ui/index.html";
 const CHINA_LIST_URLS: &[&str] = &[
     "https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt",
     "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt",
@@ -82,6 +90,9 @@ pub struct Settings {
     pub dns_hijack: bool,
     /// Leave mainland China destinations on the direct path.
     pub bypass_china: bool,
+    /// Serve the installed dashboard: the controller then listens on the LAN
+    /// address and asks for no secret.
+    pub dashboard: bool,
     pub log_level: String,
 }
 
@@ -92,6 +103,7 @@ impl Default for Settings {
             udp: true,
             dns_hijack: true,
             bypass_china: false,
+            dashboard: false,
             log_level: "warning".into(),
         }
     }
@@ -114,6 +126,7 @@ impl Settings {
                 "udp" => next.udp = flag()?,
                 "dns_hijack" => next.dns_hijack = flag()?,
                 "bypass_china" => next.bypass_china = flag()?,
+                "dashboard" => next.dashboard = flag()?,
                 "log_level" => {
                     let level = value.as_str().unwrap_or_default();
                     if !LOG_LEVELS.contains(&level) {
@@ -191,6 +204,9 @@ struct Runtime {
     /// is stale knows its process was stopped on purpose.
     generation: u64,
     secret: String,
+    /// The LAN address the controller and the dashboard listen on, when this
+    /// start opened them. `None`: loopback behind `secret`.
+    dashboard: Option<Ipv4Addr>,
     rules: Option<Plan>,
     /// Dropping it ends the `clash-guard` thread.
     guard: Option<mpsc::Sender<()>>,
@@ -263,6 +279,7 @@ impl ClashManager {
                 process: None,
                 generation: 0,
                 secret: String::new(),
+                dashboard: None,
                 rules: None,
                 guard: None,
                 china_entries: None,
@@ -324,6 +341,22 @@ impl ClashManager {
         Path::new(CONFIG).is_file()
     }
 
+    fn dashboard_installed() -> bool {
+        Path::new(DASHBOARD_INDEX).is_file()
+    }
+
+    /// The address a dashboard is served on, if `settings` ask for one and it
+    /// can be served: the files are there and the LAN address is known.
+    /// Otherwise the controller stays on loopback behind its secret. Mihomo
+    /// would download a dashboard into an empty directory, so a missing one
+    /// is never handed to it.
+    fn dashboard_address(settings: &Settings) -> Option<Ipv4Addr> {
+        if !settings.dashboard || !Self::dashboard_installed() {
+            return None;
+        }
+        net_rules::lan_network().ok().map(|network| network.addr())
+    }
+
     fn start_or_report(self: &Arc<Self>, reason: &str) {
         if let Err(error) = self.start_process() {
             eprintln!("[clash] {reason} start failed: {error}");
@@ -357,7 +390,12 @@ impl ClashManager {
     }
 
     /// Compose the runtime copy of `user` and let Mihomo check it.
-    fn build_runtime(user: &str, settings: &Settings, secret: &str) -> Result<(), String> {
+    fn build_runtime(
+        user: &str,
+        settings: &Settings,
+        secret: &str,
+        dashboard: Option<Ipv4Addr>,
+    ) -> Result<(), String> {
         if !Self::installed() {
             return Err("Mihomo is not installed".into());
         }
@@ -368,6 +406,10 @@ impl ClashManager {
             user,
             &RuntimeOptions {
                 secret,
+                dashboard: dashboard.map(|address| Dashboard {
+                    address,
+                    directory: DASHBOARD,
+                }),
                 log_level: &settings.log_level,
                 dns_hijack: settings.dns_intercepted(),
                 real_addresses: settings.real_addresses(),
@@ -392,10 +434,17 @@ impl ClashManager {
             return Err("import a Clash configuration before enabling it".into());
         }
         let settings = self.lock().saved.settings.clone();
-        let secret = new_secret()?;
+        let dashboard = Self::dashboard_address(&settings);
+        if settings.dashboard && dashboard.is_none() {
+            eprintln!("[clash] dashboard not served: no files or no LAN address; controller stays on loopback");
+        }
+        let secret = match dashboard {
+            Some(_) => String::new(),
+            None => new_secret()?,
+        };
         let user =
             fs::read_to_string(CONFIG).map_err(|e| format!("read Clash configuration: {e}"))?;
-        Self::build_runtime(&user, &settings, &secret)?;
+        Self::build_runtime(&user, &settings, &secret, dashboard)?;
         self.stop_process();
         kill_strays();
         fs::rename(RUNTIME_NEW, RUNTIME)
@@ -405,6 +454,7 @@ impl ClashManager {
             let mut state = self.lock();
             state.generation += 1;
             state.secret = secret;
+            state.dashboard = dashboard;
             state.last_error = None;
             state.generation
         };
@@ -688,7 +738,7 @@ impl ClashManager {
             return Err(format!("configuration must be 1-{MAX_CONFIG} bytes"));
         }
         let settings = self.lock().saved.settings.clone();
-        Self::build_runtime(text, &settings, "check-only")?;
+        Self::build_runtime(text, &settings, "check-only", None)?;
         let _ = fs::remove_file(RUNTIME_NEW);
         atomic_write(CONFIG_NEW, CONFIG, text.as_bytes(), 0o600)?;
         self.lock().summary = Some(clash_config::summarize(text));
@@ -700,6 +750,11 @@ impl ClashManager {
         let next = current.patched(patch)?;
         if next == current {
             return Ok(());
+        }
+        if next.dashboard && !current.dashboard && !Self::dashboard_installed() {
+            return Err(format!(
+                "no dashboard is installed: {DASHBOARD_INDEX} is missing"
+            ));
         }
         if next.transparent && next.bypass_china && load_china_list().is_empty() {
             let entries = download_china_list().map_err(|error| {
@@ -718,6 +773,7 @@ impl ClashManager {
         let restart = current.dns_intercepted() != next.dns_intercepted()
             || current.udp_intercepted() != next.udp_intercepted()
             || current.real_addresses() != next.real_addresses()
+            || current.dashboard != next.dashboard
             || current.log_level != next.log_level;
         let applied = if restart {
             self.start_process()
@@ -795,6 +851,7 @@ impl ClashManager {
         let state = self.lock();
         let settings = &state.saved.settings;
         let china_entries = china_updated.and(state.china_entries);
+        let dashboard = state.process.as_ref().and(state.dashboard);
         json!({
             "installed": Self::installed(),
             "configured": Self::configured(),
@@ -811,6 +868,11 @@ impl ClashManager {
             "mixed_port": MIXED_PORT,
             "proxy_address": format!("{lan_address}:{MIXED_PORT}"),
             "settings": settings,
+            "dashboard": {
+                "installed": Self::dashboard_installed(),
+                "active": dashboard.is_some(),
+                "url": dashboard.map(dashboard_url),
+            },
             "summary": state.summary,
             "subscription": state.saved.subscription.as_ref().map(|subscription| json!({
                 "host": url_host(&subscription.url),
@@ -821,28 +883,37 @@ impl ClashManager {
         })
     }
 
-    /// The controller's address and this start's secret, while Mihomo runs.
-    fn controller(&self) -> Result<(ureq::Agent, String), String> {
-        let secret = {
+    /// The controller's address and what it asks for, while Mihomo runs: this
+    /// start's secret on loopback, nothing while a dashboard is served.
+    fn controller(&self) -> Result<(ureq::Agent, String, Option<String>), String> {
+        let (address, authorization) = {
             let state = self.lock();
             if state.process.is_none() {
                 return Err("Mihomo is not running".into());
             }
-            state.secret.clone()
+            match state.dashboard {
+                Some(address) => (format!("{address}:{CONTROLLER_PORT}"), None),
+                None => (
+                    CONTROLLER.to_owned(),
+                    Some(format!("Bearer {}", state.secret)),
+                ),
+            }
         };
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
             .proxy(None)
             .build()
             .into();
-        Ok((agent, format!("Bearer {secret}")))
+        Ok((agent, address, authorization))
     }
 
     fn controller_get(&self, path: &str) -> Result<Value, String> {
-        let (agent, authorization) = self.controller()?;
-        agent
-            .get(format!("http://{CONTROLLER}{path}"))
-            .header("Authorization", authorization)
+        let (agent, address, authorization) = self.controller()?;
+        let mut request = agent.get(format!("http://{address}{path}"));
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", authorization);
+        }
+        request
             .call()
             .map_err(|error| controller_error(&error))?
             .into_body()
@@ -851,10 +922,12 @@ impl ClashManager {
     }
 
     fn controller_put(&self, path: &str, body: &Value) -> Result<(), String> {
-        let (agent, authorization) = self.controller()?;
-        agent
-            .put(format!("http://{CONTROLLER}{path}"))
-            .header("Authorization", authorization)
+        let (agent, address, authorization) = self.controller()?;
+        let mut request = agent.put(format!("http://{address}{path}"));
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", authorization);
+        }
+        request
             .send_json(body)
             .map(|_| ())
             .map_err(|error| controller_error(&error))
@@ -867,6 +940,13 @@ fn controller_error(error: &ureq::Error) -> String {
         ureq::Error::StatusCode(code) => format!("Mihomo refused the request (HTTP {code})"),
         other => format!("Mihomo controller unavailable: {other}"),
     }
+}
+
+/// Where a browser opens the dashboard. The query tells it which controller
+/// to talk to (Yacd, MetaCubeXD and Zashboard all read it), so a dashboard
+/// works as it was downloaded, whatever the LAN address is.
+fn dashboard_url(address: Ipv4Addr) -> String {
+    format!("http://{address}:{CONTROLLER_PORT}/ui/?hostname={address}&port={CONTROLLER_PORT}")
 }
 
 /// Mihomo with both output streams on one pipe. Must be called on the thread
@@ -1379,6 +1459,7 @@ mod tests {
         assert!(saved.enabled);
         assert_eq!(saved.settings, Settings::default());
         assert!(!saved.settings.transparent);
+        assert!(!saved.settings.dashboard);
         assert!(saved.subscription.is_none());
 
         let odd: SavedState = serde_json::from_slice(
@@ -1412,6 +1493,25 @@ mod tests {
         assert!(base.patched(&json!({"log_level": "trace"})).is_err());
         assert!(base.patched(&json!({"tun": true})).is_err());
         assert!(base.patched(&json!([])).is_err());
+    }
+
+    #[test]
+    fn the_dashboard_is_off_until_the_owner_opens_it() {
+        let base = Settings::default();
+        assert!(!base.dashboard);
+        assert_eq!(ClashManager::dashboard_address(&base), None);
+        let open = base.patched(&json!({"dashboard": true})).unwrap();
+        assert!(open.dashboard && !open.transparent);
+        assert!(base.patched(&json!({"dashboard": "yes"})).is_err());
+        assert_eq!(
+            dashboard_url(Ipv4Addr::new(192, 168, 0, 1)),
+            "http://192.168.0.1:9091/ui/?hostname=192.168.0.1&port=9091"
+        );
+        let saved: SavedState = serde_json::from_slice(
+            br#"{"enabled":true,"settings":{"transparent":true,"dashboard":true}}"#,
+        )
+        .unwrap();
+        assert!(saved.settings.dashboard && saved.settings.udp);
     }
 
     #[test]
@@ -1502,6 +1602,9 @@ mod tests {
         assert_eq!(body["data"]["running"], false);
         assert_eq!(body["data"]["mode"], "explicit_proxy");
         assert_eq!(body["data"]["settings"]["transparent"], false);
+        assert_eq!(body["data"]["settings"]["dashboard"], false);
+        assert_eq!(body["data"]["dashboard"]["active"], false);
+        assert!(body["data"]["dashboard"]["url"].is_null());
         assert!(body["data"].get("secret").is_none());
         assert_eq!(proxies(&manager).0, 409);
         assert_eq!(select_proxy(&manager, b"{}").0, 400);
